@@ -1,0 +1,303 @@
+import asyncio
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from backend.models.schemas import (
+    JobRequest,
+    JobStatusResponse,
+    JobResultsResponse,
+    PipelineStepInfo,
+    StepStatus,
+    CompoundResult,
+)
+from backend.pipeline.analogue_gen import generate_analogues
+from backend.pipeline.drug_likeness import filter_by_drug_likeness
+from backend.pipeline.admet import run_admet_batch
+from backend.pipeline.binding_prefilter import run_binding_prefilter
+from backend.pipeline.protein_prep import prepare_receptor
+from backend.pipeline.docking import dock_compounds, cleanup_docking_files
+from backend.pipeline.retrosynthesis import run_retrosynthesis_batch
+from backend.pipeline.scorer import score_and_rank
+from backend.utils.pdb_fetcher import fetch_pdb_by_id, save_pdb_from_content
+from backend.utils.smiles_validator import validate_and_canonicalize
+
+JOBS_DIR = Path("storage/jobs")
+
+
+class PipelineOrchestrator:
+    """
+    Master controller for a single pipeline job.
+    Manages status updates, error handling, and step sequencing.
+    All status is written to disk (storage/jobs/{job_id}/) so the
+    FastAPI polling endpoint can read it without any shared memory.
+    """
+
+    def __init__(self, job_id: str, request: JobRequest):
+        self.job_id  = job_id
+        self.request = request
+        self.job_dir = JOBS_DIR / job_id
+        self.job_dir.mkdir(parents=True, exist_ok=True)
+
+        self.created_at  = datetime.now(timezone.utc)
+        self.steps: list[PipelineStepInfo] = []
+        self._init_steps()
+
+    def _init_steps(self):
+        """Pre-populate all pipeline steps as 'waiting'."""
+        step_names = [
+            "Analogue Generation",
+            "Drug-likeness Filter (Lipinski + ESOL)",
+            "ADMET Toxicity Filter",
+            "ML Binding Pre-filter",
+            "Protein Preparation",
+            "Molecular Docking (GNINA)",
+            "Retrosynthesis (ASKCOS)",
+            "Scoring & Ranking",
+        ]
+        for name in step_names:
+            self.steps.append(PipelineStepInfo(name=name, status=StepStatus.waiting))
+        self._write_status("queued")
+
+    # ── Status helpers ───────────────────────────────────────────────────────
+
+    def _write_status(self, status: str, error: Optional[str] = None):
+        """Writes current status to status.json for the polling endpoint."""
+        payload = JobStatusResponse(
+            job_id=self.job_id,
+            status=status,
+            created_at=self.created_at,
+            updated_at=datetime.now(timezone.utc),
+            steps=self.steps,
+            error=error,
+        )
+        status_path = self.job_dir / "status.json"
+        status_path.write_text(payload.model_dump_json(indent=2))
+
+    def _step_start(self, index: int):
+        self.steps[index].status = StepStatus.running
+        self._write_status("running")
+
+    def _step_done(self, index: int, message: str, elapsed: float):
+        self.steps[index].status = StepStatus.done
+        self.steps[index].message = message
+        self.steps[index].duration_seconds = round(elapsed, 2)
+        self._write_status("running")
+
+    def _step_skip(self, index: int, reason: str = "Disabled by user"):
+        self.steps[index].status = StepStatus.skipped
+        self.steps[index].message = reason
+        self._write_status("running")
+
+    def _step_fail(self, index: int, error: str):
+        self.steps[index].status = StepStatus.failed
+        self.steps[index].message = error
+        self._write_status("failed", error=error)
+
+    # ── Main entry point ─────────────────────────────────────────────────────
+
+    async def run(self):
+        """
+        Executes the full pipeline in the correct funnel order.
+        Each step reads the survivors from the previous step.
+        Protein prep runs concurrently with ADMET to save wall-clock time.
+        """
+        req = self.request
+        compound_results: dict[str, CompoundResult] = {}
+
+        try:
+            # ── STEP 0: Validate SMILES ──────────────────────────────────────
+            is_valid, canonical_smiles, err = validate_and_canonicalize(req.smiles)
+            if not is_valid:
+                raise ValueError(f"Invalid SMILES: {err}")
+
+            # ── STEP 1: Analogue Generation ──────────────────────────────────
+            t = time.time()
+            self._step_start(0)
+            analogues = generate_analogues(canonical_smiles, req.num_analogues)
+            if not analogues:
+                raise RuntimeError("Analogue generation produced 0 compounds.")
+            self._step_done(0, f"{len(analogues)} analogues generated", time.time() - t)
+
+            # Initialize CompoundResult for each analogue
+            for smi in analogues:
+                compound_results[smi] = CompoundResult(
+                    smiles=smi,
+                    canonical_smiles=smi,
+                )
+
+            # ── STEP 2: Drug-likeness Filter ─────────────────────────────────
+            t = time.time()
+            self._step_start(1)
+            if req.pipeline_steps.drug_likeness:
+                passed_lipinski, lipinski_results = filter_by_drug_likeness(analogues)
+                for smi, result in zip(analogues, lipinski_results):
+                    compound_results[smi].lipinski = result
+                msg = f"{len(passed_lipinski)}/{len(analogues)} passed Lipinski + ESOL"
+                self._step_done(1, msg, time.time() - t)
+                surviving = passed_lipinski
+            else:
+                self._step_skip(1)
+                surviving = analogues
+
+            if not surviving:
+                raise RuntimeError("No compounds survived the drug-likeness filter.")
+
+            # ── STEP 3 + PROTEIN PREP (concurrent) ───────────────────────────
+            # ADMET filter + protein preparation run at the same time.
+            # Protein prep takes ~20s and is independent of ADMET results.
+
+            self._step_start(2)  # ADMET
+            self._step_start(4)  # Protein Prep (index 4)
+
+            # Get raw PDB path
+            t_pdb = time.time()
+            if req.pdb_id:
+                raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
+            else:
+                raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
+
+            # Run ADMET and protein prep concurrently
+            t_admet = time.time()
+            admet_task   = asyncio.to_thread(run_admet_batch, surviving)
+            protprep_task = asyncio.to_thread(
+                prepare_receptor, raw_pdb_path, self.job_id
+            )
+            (passed_admet, admet_results), receptor_pdbqt = await asyncio.gather(
+                admet_task, protprep_task
+            )
+
+            # Store ADMET results
+            for smi, result in zip(surviving, admet_results):
+                compound_results[smi].admet = result
+            self._step_done(
+                2,
+                f"{len(passed_admet)}/{len(surviving)} passed ADMET",
+                time.time() - t_admet,
+            )
+            self._step_done(
+                4,
+                f"Receptor prepared → {Path(receptor_pdbqt).name}",
+                time.time() - t_pdb,
+            )
+            surviving = passed_admet
+
+            if not surviving:
+                raise RuntimeError("No compounds survived the ADMET filter.")
+
+            # ── STEP 4: ML Binding Pre-filter ────────────────────────────────
+            t = time.time()
+            self._step_start(3)
+            if req.pipeline_steps.binding_prefilter:
+                top_smiles, prefilter_results = await asyncio.to_thread(
+                    run_binding_prefilter, surviving, 5
+                )
+                for smi, result in zip(surviving, prefilter_results):
+                    compound_results[smi].binding_prefilter = result
+                self._step_done(
+                    3,
+                    f"Top {len(top_smiles)}/{len(surviving)} selected for docking",
+                    time.time() - t,
+                )
+                surviving = top_smiles
+            else:
+                self._step_skip(3)
+                surviving = surviving[:5]  # still cap at 5 for compute sanity
+
+            if not surviving:
+                raise RuntimeError("No compounds survived the binding pre-filter.")
+
+            # ── STEP 5: GNINA Docking ────────────────────────────────────────
+            t = time.time()
+            self._step_start(5)
+            if req.pipeline_steps.docking:
+                passed_docking, docking_results = await asyncio.to_thread(
+                    dock_compounds,
+                    surviving,
+                    receptor_pdbqt,
+                    self.job_id,
+                    raw_pdb_path,
+                    req.binding_site_mode,
+                    req.docking_speed,
+                    req.binding_site_coords,
+                    req.binding_site_residues,
+                )
+                for smi, result in zip(surviving, docking_results):
+                    compound_results[smi].docking = result
+                self._step_done(
+                    5,
+                    f"{len(passed_docking)}/{len(surviving)} passed docking (affinity ≤ -6.0 kcal/mol)",
+                    time.time() - t,
+                )
+                surviving = passed_docking if passed_docking else surviving[:3]
+            else:
+                self._step_skip(5)
+
+            # ── STEP 6: Retrosynthesis ───────────────────────────────────────
+            t = time.time()
+            self._step_start(6)
+            if req.pipeline_steps.retrosynthesis:
+                top_for_retro = surviving[:3]   # absolute max 3 for compute budget
+                retro_results = await run_retrosynthesis_batch(top_for_retro)
+                for smi, result in zip(top_for_retro, retro_results):
+                    compound_results[smi].retrosynthesis = result
+                feasible_count = sum(1 for r in retro_results if r.feasible)
+                self._step_done(
+                    6,
+                    f"{feasible_count}/{len(top_for_retro)} compounds have feasible synthesis routes",
+                    time.time() - t,
+                )
+            else:
+                self._step_skip(6)
+
+            # ── STEP 7: Scoring & Ranking ────────────────────────────────────
+            t = time.time()
+            self._step_start(7)
+            all_compounds = list(compound_results.values())
+            ranked = score_and_rank(all_compounds)
+            self._step_done(7, f"Ranked {len(ranked)} compounds", time.time() - t)
+
+            # ── Write final results ──────────────────────────────────────────
+            self._write_results(ranked, canonical_smiles, len(analogues))
+            self._write_status("done")
+            cleanup_docking_files(self.job_id)
+
+        except Exception as e:
+            print(f"[Orchestrator] Job {self.job_id} failed: {e}")
+            failed_step = next(
+                (i for i, s in enumerate(self.steps) if s.status == StepStatus.running),
+                7,
+            )
+            self._step_fail(failed_step, str(e))
+            self._write_status("failed", error=str(e))
+            raise
+
+    def _write_results(
+        self,
+        ranked: list[CompoundResult],
+        base_smiles: str,
+        total_generated: int,
+    ):
+        """Writes the final ranked results to results.json."""
+        def _count(attr: str) -> int:
+            return sum(
+                1 for c in ranked
+                if getattr(c, attr) and getattr(getattr(c, attr), "passed", False)
+            )
+
+        results = JobResultsResponse(
+            job_id=self.job_id,
+            base_smiles=base_smiles,
+            total_analogues_generated=total_generated,
+            compounds_after_lipinski=_count("lipinski"),
+            compounds_after_admet=_count("admet"),
+            compounds_after_prefilter=_count("binding_prefilter"),
+            compounds_docked=_count("docking"),
+            final_ranked_compounds=ranked,
+            created_at=self.created_at,
+            completed_at=datetime.now(timezone.utc),
+        )
+        results_path = self.job_dir / "results.json"
+        results_path.write_text(results.model_dump_json(indent=2))
