@@ -26,5 +26,11 @@ onnxruntime==1.16.3
 # ── Utilities ─────────────────────────────────────────────────────────────────
 requests==2.32.3
 tqdm==4.67.1
+# aizynthfinder requires pandas<2.0.0
 pandas==1.5.3
 scipy==1.11.4
+
+# ── CRITICAL: pin xarray to last version supporting pandas 1.x ────────────────
+# admet-ai → chemprop → descriptastorus → pandas_flavor → xarray
+# xarray >= 2023.9 drops pandas 1.x and causes AttributeError: NumpyExtensionArray
+xarray==2023.6.0
