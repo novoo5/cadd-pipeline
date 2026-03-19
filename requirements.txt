@@ -1,44 +1,35 @@
-# ── Web framework ─────────────────────────────────────────────────────────────
+# ── Web Framework ─────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 python-multipart==0.0.12
 httpx==0.27.2
+pydantic==2.10.3
+python-dotenv==1.0.1
 
-# ── Async job queue ───────────────────────────────────────────────────────────
-arq==0.26.1
+# ── Job Queue ─────────────────────────────────────────────────────────────────
+arq==0.26.3
 redis==5.2.0
 
-# ── Cheminformatics (RDKit) ───────────────────────────────────────────────────
+# ── Chemistry ─────────────────────────────────────────────────────────────────
 rdkit==2024.3.6
 
-# ── ADMET prediction ──────────────────────────────────────────────────────────
-admet-ai==1.1.2
+# ── CRITICAL: pin numpy before any ML installs ───────────────────────────────
+# aizynthfinder hard-requires numpy<2.0.0
+# dgl==2.1.0 will try to pull numpy==2.4.x without this pin
+numpy==1.26.4
 
-# ── Protein prep ─────────────────────────────────────────────────────────────
-pdbfixer==1.9
-openmm==8.1.2
+# ── ADMET ─────────────────────────────────────────────────────────────────────
+admet-ai==2.0.1
 
-# ── Ligand prep for GNINA ────────────────────────────────────────────────────
-meeko==0.5.0
+# ── ML / Binding Pre-filter ───────────────────────────────────────────────────
+# deepchem supports Python >=3.7,<3.12 — 3.11 is fine
+deepchem==2.7.1
 
 # ── Retrosynthesis ────────────────────────────────────────────────────────────
 aizynthfinder==4.3.2
-tensorflow==2.15.0          # required by aizynthfinder policy network
-tensorflow-probability==0.23.0
-
-# ── DeepChem binding prefilter ────────────────────────────────────────────────
-# NOTE: torch is installed separately in Dockerfile (CPU-only wheel)
-# to avoid pulling in the 2GB CUDA version here.
-deepchem==2.8.0
-dgllife==0.3.2              # DGL graph features used by AttentiveFP
-
-# ── Data science core ─────────────────────────────────────────────────────────
-numpy==1.26.4
-pandas==2.2.3
-scipy==1.13.1
-scikit-learn==1.5.2
+onnxruntime==1.16.3
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-pyyaml==6.0.2
-python-dotenv==1.0.1
-aiofiles==24.1.0
+requests==2.32.3
+tqdm==4.67.1
+pandas==2.2.3
