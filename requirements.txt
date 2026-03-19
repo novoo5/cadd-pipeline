@@ -27,5 +27,6 @@ onnxruntime==1.16.3
 # ── Utilities ─────────────────────────────────────────────────────────────────
 requests==2.32.3
 tqdm==4.67.1
-pandas==2.2.3
+# Must be <2.0.0 for aizynthfinder
+pandas==1.5.3
 scipy==1.11.4
