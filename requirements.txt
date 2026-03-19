@@ -13,17 +13,12 @@ redis==5.2.0
 # ── Chemistry ─────────────────────────────────────────────────────────────────
 rdkit==2024.3.6
 
-# ── CRITICAL: pin numpy before any ML installs ───────────────────────────────
-# aizynthfinder hard-requires numpy<2.0.0
-# dgl==2.1.0 will try to pull numpy==2.4.x without this pin
-numpy==1.26.4
-
 # ── ADMET ─────────────────────────────────────────────────────────────────────
 admet-ai==2.0.1
 
 # ── ML / Binding Pre-filter ───────────────────────────────────────────────────
-# deepchem supports Python >=3.7,<3.12 — 3.11 is fine
-deepchem==2.7.1
+# We MUST use 2.8.0 because 2.7.1 does not support Python 3.11
+deepchem==2.8.0
 
 # ── Retrosynthesis ────────────────────────────────────────────────────────────
 aizynthfinder==4.3.2
@@ -33,3 +28,4 @@ onnxruntime==1.16.3
 requests==2.32.3
 tqdm==4.67.1
 pandas==2.2.3
+scipy==1.11.4
