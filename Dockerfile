@@ -20,7 +20,6 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu
 
 # ── CRITICAL: Pin numpy BEFORE dgl so dgl doesn't pull numpy 2.x ─────────────
-# aizynthfinder requires numpy<2.0.0
 RUN pip install --no-cache-dir "numpy==1.26.4"
 
 # ── DGL (Graph Neural Networks for binding pre-filter) ────────────────────────
@@ -31,7 +30,9 @@ RUN pip install --no-cache-dir \
 # ── App dependencies ──────────────────────────────────────────────────────────
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# We use the legacy resolver to bypass the RDKit/Pandas mutual exclusivity conflict
+RUN pip install --no-cache-dir --use-deprecated=legacy-resolver -r requirements.txt
 
 # ── AiZynthFinder model download (optional — has fallback if it fails) ────────
 RUN python -c "from aizynthfinder.tools.download_public_data import main; main('/root/.aizynthfinder')" || echo "[AiZynth] Model download failed — retrosynthesis will use fallback"
