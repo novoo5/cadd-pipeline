@@ -1,6 +1,5 @@
 # backend/pipeline/docking.py
 import subprocess
-import re
 import traceback
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -30,7 +29,7 @@ ENERGY_RANGE = 3.0
 
 def dock_compounds(
     smiles_list: List[str],
-    receptor_pdb: str,  # ✅ Changed to accept PDB directly
+    receptor_pdbqt: str,
     job_id: str,
     raw_pdb_path: str,
     binding_site_mode: BindingSiteMode,
@@ -56,11 +55,10 @@ def dock_compounds(
         try:
             result = _dock_single(
                 smiles=smi,
-                receptor_pdb=receptor_pdb,
+                receptor_pdbqt=receptor_pdbqt,
                 job_id=job_id,
                 compound_index=idx,
                 cx=cx, cy=cy, cz=cz,
-                box_size=box_size,
                 exhaustiveness=exhaustiveness,
             )
             all_results.append(result)
@@ -80,20 +78,54 @@ def dock_compounds(
     return passed_smiles, all_results
 
 
+def _get_ligand_box_size(ligand_pdbqt: str, padding: float = 8.0) -> float:
+    """
+    Calculates a dynamic docking box size from the ligand's actual 3D
+    atom coordinates + padding. Clamps between 20 and 30 Å.
+    Prevents grid overflow for large molecules and wasted space for small ones.
+    """
+    coords = []
+    try:
+        with open(ligand_pdbqt) as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append((x, y, z))
+        if not coords:
+            return 25.0
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        zs = [c[2] for c in coords]
+        span = max(
+            max(xs) - min(xs),
+            max(ys) - min(ys),
+            max(zs) - min(zs),
+        )
+        size = max(20.0, min(span + padding, 30.0))
+        return round(size, 1)
+    except Exception:
+        return 25.0
+
+
 def _dock_single(
     smiles: str,
-    receptor_pdb: str,
+    receptor_pdbqt: str,
     job_id: str,
     compound_index: int,
     cx: float,
     cy: float,
     cz: float,
-    box_size: float,
     exhaustiveness: int,
 ) -> DockingResult:
 
     ligand_pdbqt = prepare_ligand(smiles, job_id, compound_index)
     print(f"[Docking] Ligand prepared: {ligand_pdbqt}")
+
+    # ✅ Dynamic box size from actual ligand 3D dimensions
+    dynamic_box = _get_ligand_box_size(ligand_pdbqt)
+    print(f"[Docking] Dynamic box size: {dynamic_box} Å")
 
     out_dir = JOBS_DIR / job_id / "docking_outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -101,15 +133,15 @@ def _dock_single(
 
     cmd = [
         "vina",
-        "--receptor",       receptor_pdb,  # ✅ Vina natively accepts .pdb format
+        "--receptor",       receptor_pdbqt,
         "--ligand",         ligand_pdbqt,
         "--out",            out_pdbqt,
         "--center_x",       str(round(cx, 3)),
         "--center_y",       str(round(cy, 3)),
         "--center_z",       str(round(cz, 3)),
-        "--size_x",         str(round(box_size, 1)),
-        "--size_y",         str(round(box_size, 1)),
-        "--size_z",         str(round(box_size, 1)),
+        "--size_x",         str(dynamic_box),
+        "--size_y",         str(dynamic_box),
+        "--size_z",         str(dynamic_box),
         "--exhaustiveness", str(exhaustiveness),
         "--num_modes",      str(NUM_MODES),
         "--energy_range",   str(ENERGY_RANGE),
@@ -130,7 +162,7 @@ def _dock_single(
 
     print(f"[Docking] returncode: {proc.returncode}")
     print(f"[Docking] stdout: {proc.stdout[:2000]}")
-    print(f"[Docking] stderr: {proc.stderr[:2000]}")
+    print(f"[Docking] stderr: {proc.stderr[:500]}")
 
     if proc.returncode != 0:
         raise RuntimeError(
@@ -155,21 +187,33 @@ def _dock_single(
 
 
 def _parse_vina_output(stdout: str) -> List[DockingPose]:
+    """
+    Parses AutoDock Vina stdout table:
+    -----+------------+----------+----------
+       1       -8.412      0.000      0.000
+    """
     poses = []
-    pattern = re.compile(
-        r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
-        re.MULTILINE,
-    )
-    for match in pattern.finditer(stdout):
-        try:
-            poses.append(DockingPose(
-                rank=int(match.group(1)),
-                affinity_kcal=float(match.group(2)),
-                rmsd_lb=float(match.group(3)),
-                rmsd_ub=float(match.group(4)),
-            ))
-        except (ValueError, IndexError):
+    in_table = False
+    for line in stdout.splitlines():
+        if line.strip().startswith("-----+"):
+            in_table = True
             continue
+        if in_table:
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    mode     = int(parts[0])
+                    affinity = float(parts[1])
+                    rmsd_lb  = float(parts[2])
+                    rmsd_ub  = float(parts[3])
+                    poses.append(DockingPose(
+                        pose_number=mode,
+                        affinity_kcal=round(affinity, 4),
+                        rmsd_lower=round(rmsd_lb, 3),
+                        rmsd_upper=round(rmsd_ub, 3),
+                    ))
+                except (ValueError, IndexError):
+                    break
     return poses
 
 
