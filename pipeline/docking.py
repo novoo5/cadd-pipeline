@@ -1,11 +1,9 @@
 # backend/pipeline/docking.py
-import subprocess
 import os
 import re
-import asyncio
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 from backend.models.schemas import (
     DockingResult,
     DockingPose,
@@ -20,15 +18,14 @@ from backend.utils.binding_site import get_binding_site_box
 
 JOBS_DIR = Path("storage/jobs")
 
-
 EXHAUSTIVENESS_MAP = {
-    DockingSpeed.fast:     2,
-    DockingSpeed.balanced: 4,
-    DockingSpeed.thorough: 8,
+    DockingSpeed.fast:     4,
+    DockingSpeed.balanced: 8,
+    DockingSpeed.thorough: 16,
 }
 
-NUM_MODES        = 3
-ENERGY_RANGE     = 3.0
+NUM_MODES    = 3
+ENERGY_RANGE = 3.0
 
 
 def dock_compounds(
@@ -41,7 +38,7 @@ def dock_compounds(
     binding_site_coords: Optional[BindingSiteCoords] = None,
     binding_site_residues: Optional[BindingSiteResidues] = None,
 ) -> Tuple[List[str], List[DockingResult]]:
-    from backend.models.schemas import BindingSiteMode as BSM
+
     center, box_size = get_binding_site_box(
         pdb_path=raw_pdb_path,
         mode=binding_site_mode,
@@ -71,7 +68,6 @@ def dock_compounds(
                 passed_smiles.append(smi)
 
         except Exception as e:
-            # ✅ FULL traceback so we can see the real crash reason in HF logs
             print(f"[Docking] FULL ERROR for compound {idx}:")
             print(traceback.format_exc())
             all_results.append(DockingResult(
@@ -95,118 +91,70 @@ def _dock_single(
     box_size: float,
     exhaustiveness: int,
 ) -> DockingResult:
+    from vina import Vina
+
     ligand_pdbqt = prepare_ligand(smiles, job_id, compound_index)
+    print(f"[Docking] Ligand prepared: {ligand_pdbqt}")
 
     out_dir = JOBS_DIR / job_id / "docking_outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pdbqt = str(out_dir / f"out_{compound_index}.pdbqt")
-    log_file  = str(out_dir / f"log_{compound_index}.txt")
 
-    cmd = [
-        "gnina",
-        "--receptor",       receptor_pdbqt,
-        "--ligand",         ligand_pdbqt,
-        "--out",            out_pdbqt,
-        "--log",            log_file,
-        "--center_x",       str(round(cx, 3)),
-        "--center_y",       str(round(cy, 3)),
-        "--center_z",       str(round(cz, 3)),
-        "--size_x",         str(round(box_size, 1)),
-        "--size_y",         str(round(box_size, 1)),
-        "--size_z",         str(round(box_size, 1)),
-        "--exhaustiveness", str(exhaustiveness),
-        "--num_modes",      str(NUM_MODES),
-        "--energy_range",   str(ENERGY_RANGE),
-        "--cnn_scoring",    "none",
-        "--cpu",            "2",
-        "--no_gpu",
-    ]
+    # Initialize AutoDock Vina
+    v = Vina(sf_name='vina', cpu=2, verbosity=1)
 
-    print(f"[GNINA CMD]: {' '.join(cmd)}")
+    print(f"[Docking] Loading receptor: {receptor_pdbqt}")
+    v.set_receptor(receptor_pdbqt)
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"GNINA timed out after 5 minutes for compound {compound_index}."
-        )
+    print(f"[Docking] Loading ligand: {ligand_pdbqt}")
+    v.set_ligand_from_file(ligand_pdbqt)
 
-    print(f"[GNINA returncode]: {proc.returncode}")
-    print(f"[GNINA stdout]: {proc.stdout[:2000]}")
-    print(f"[GNINA stderr]: {proc.stderr[:2000]}")
+    # Define search box
+    v.compute_vina_maps(
+        center=[cx, cy, cz],
+        box_size=[box_size, box_size, box_size],
+    )
 
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"GNINA exited with code {proc.returncode}:\n"
-            f"STDERR: {proc.stderr[:500]}"
-        )
+    print(f"[Docking] Running docking with exhaustiveness={exhaustiveness}...")
+    v.dock(exhaustiveness=exhaustiveness, n_poses=NUM_MODES)
 
-    poses = _parse_gnina_log(log_file)
+    # Get scores
+    energies = v.energies(n_poses=NUM_MODES)
+    print(f"[Docking] Raw energies: {energies}")
+
+    if energies is None or len(energies) == 0:
+        raise RuntimeError(f"Vina returned no poses for compound {compound_index}")
+
+    # Write output
+    v.write_poses(out_pdbqt, n_poses=NUM_MODES, overwrite=True)
+
+    poses = []
+    for i, energy in enumerate(energies):
+        try:
+            poses.append(DockingPose(
+                rank=i + 1,
+                affinity_kcal=float(energy[0]),  # index 0 = total energy
+                rmsd_lb=float(energy[1]) if len(energy) > 1 else 0.0,
+                rmsd_ub=float(energy[2]) if len(energy) > 2 else 0.0,
+            ))
+        except (ValueError, IndexError) as e:
+            print(f"[Docking] Pose parse error at index {i}: {e}")
+            continue
+
     if not poses:
-        raise RuntimeError(f"GNINA produced no poses for compound {compound_index}.")
+        raise RuntimeError(f"Could not parse any poses for compound {compound_index}")
 
-    best_pose = poses[0]
-    best_affinity = best_pose.affinity_kcal
-    best_cnn_score = _extract_cnn_score(log_file)
+    best_affinity = poses[0].affinity_kcal
+    print(f"[Docking] Best affinity: {best_affinity} kcal/mol")
 
     passed = best_affinity <= -6.0
 
     return DockingResult(
         passed=passed,
         best_affinity_kcal=round(best_affinity, 4),
-        cnn_score=round(best_cnn_score, 4),
+        cnn_score=0.0,  # Vina doesn't have CNN score, that's GNINA-specific
         poses=poses,
     )
-
-
-def _parse_gnina_log(log_file: str) -> List[DockingPose]:
-    poses = []
-    if not Path(log_file).exists():
-        return poses
-
-    with open(log_file, "r") as f:
-        content = f.read()
-
-    pattern = re.compile(
-        r"^\s*(\d+)\s*\|\s*([-\d.]+)\s*\|\s*([-\d.]+)\s*\|\s*([-\d.]+)\s*\|\s*([-\d.]+)",
-        re.MULTILINE,
-    )
-    for match in pattern.finditer(content):
-        try:
-            poses.append(DockingPose(
-                rank=int(match.group(1)),
-                affinity_kcal=float(match.group(2)),
-                rmsd_lb=float(match.group(4)),
-                rmsd_ub=float(match.group(5)),
-            ))
-        except (ValueError, IndexError):
-            continue
-
-    return poses
-
-
-def _extract_cnn_score(log_file: str) -> float:
-    if not Path(log_file).exists():
-        return 0.0
-    with open(log_file, "r") as f:
-        content = f.read()
-
-    pattern = re.compile(
-        r"^\s*1\s*\|\s*[-\d.]+\s*\|\s*([-\d.]+)",
-        re.MULTILINE,
-    )
-    match = pattern.search(content)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return 0.0
-    return 0.0
 
 
 def cleanup_docking_files(job_id: str) -> None:
