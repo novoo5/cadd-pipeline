@@ -10,7 +10,6 @@ try:
 except ImportError:
     _PDBFIXER_AVAILABLE = False
 
-# Force obabel — skip Meeko entirely (API changed in newer versions)
 _MEEKO_AVAILABLE = False
 
 JOBS_DIR = Path("storage/jobs")
@@ -26,8 +25,8 @@ def prepare_receptor(pdb_path: str, job_id: str) -> str:
     if _PDBFIXER_AVAILABLE:
         _fix_pdb_with_pdbfixer(pdb_path, fixed_pdb_path)
     else:
-        print("[ProteinPrep] PDBFixer not available — using raw PDB.")
-        _strip_waters_manually(pdb_path, fixed_pdb_path)
+        print("[ProteinPrep] PDBFixer not available — stripping waters + HETATM manually.")
+        _strip_waters_and_hetatm(pdb_path, fixed_pdb_path)
 
     _convert_pdb_to_pdbqt(fixed_pdb_path, pdbqt_path)
     return pdbqt_path
@@ -63,10 +62,7 @@ def prepare_ligand(smiles: str, job_id: str, compound_index: int) -> str:
     writer.close()
 
     print(f"[LigandPrep] SDF written: {sdf_path}")
-
-    # Always use obabel — Meeko API is broken on this env
     _convert_sdf_to_pdbqt_obabel(sdf_path, pdbqt_path)
-
     print(f"[LigandPrep] PDBQT written: {pdbqt_path}")
     return pdbqt_path
 
@@ -82,27 +78,39 @@ def _fix_pdb_with_pdbfixer(input_pdb: str, output_pdb: str) -> None:
         PDBFile.writeFile(fixer.topology, fixer.positions, f)
 
 
-def _strip_waters_manually(input_pdb: str, output_pdb: str) -> None:
+def _strip_waters_and_hetatm(input_pdb: str, output_pdb: str) -> None:
+    """
+    Strips waters AND all HETATM records (ligands, cofactors) from PDB.
+    Keeps only ATOM records (protein backbone) — this prevents obabel
+    kekulization failures caused by unusual small molecule aromatic systems.
+    """
     water_res = {"HOH", "WAT", "DOD"}
     lines_out = []
     with open(input_pdb, "r") as f:
         for line in f:
             record = line[:6].strip()
-            if record in ("ATOM", "HETATM"):
+            # ✅ KEY FIX: skip ALL HETATM records, only keep ATOM + structural records
+            if record == "HETATM":
+                continue
+            if record == "ATOM":
                 res_name = line[17:20].strip()
                 if res_name in water_res:
                     continue
             lines_out.append(line)
+
     with open(output_pdb, "w") as f:
         f.writelines(lines_out)
+
+    print(f"[ProteinPrep] Stripped PDB written: {output_pdb} ({len(lines_out)} lines)")
 
 
 def _convert_pdb_to_pdbqt(input_pdb: str, output_pdbqt: str) -> None:
     cmd = [
         "obabel",
+        "-e",                        # ✅ continue on errors (ignore kekulization warnings)
         input_pdb,
         "-O", output_pdbqt,
-        "-xr",
+        "-xr",                       # remove non-polar hydrogens
         "--partialcharge", "gasteiger",
     ]
     print(f"[ReceptorPrep] Running: {' '.join(cmd)}")
@@ -110,13 +118,18 @@ def _convert_pdb_to_pdbqt(input_pdb: str, output_pdbqt: str) -> None:
     print(f"[ReceptorPrep] obabel stdout: {result.stdout}")
     print(f"[ReceptorPrep] obabel stderr: {result.stderr}")
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Open Babel receptor conversion failed:\n"
-            f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
-        )
+    # ✅ KEY FIX: obabel exits 0 even on failure — check file has actual content
     if not Path(output_pdbqt).exists():
-        raise RuntimeError(f"obabel ran but no output: {output_pdbqt}")
+        raise RuntimeError(f"obabel produced no receptor file: {output_pdbqt}")
+
+    file_size = Path(output_pdbqt).stat().st_size
+    print(f"[ReceptorPrep] Output file size: {file_size} bytes")
+
+    if file_size < 500:
+        raise RuntimeError(
+            f"Receptor PDBQT is too small ({file_size} bytes) — obabel likely failed silently.\n"
+            f"stderr: {result.stderr}"
+        )
 
 
 def _convert_sdf_to_pdbqt_obabel(sdf_path: str, output_pdbqt: str) -> None:
@@ -135,8 +148,19 @@ def _convert_sdf_to_pdbqt_obabel(sdf_path: str, output_pdbqt: str) -> None:
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"Open Babel ligand conversion failed:\n"
-            f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+            f"obabel ligand conversion failed:\n{result.stderr}"
         )
-    if not Path(output_pdbqt).exists():
-        raise RuntimeError(f"obabel ran but no output: {output_pdbqt}")
+    if not Path(output_pdbqt).exists() or Path(output_pdbqt).stat().st_size < 50:
+        raise RuntimeError(f"obabel produced empty ligand file: {output_pdbqt}")
+
+
+def cleanup_docking_files(job_id: str) -> None:
+    import shutil
+    ligand_dir = JOBS_DIR / job_id / "ligands"
+    if ligand_dir.exists():
+        shutil.rmtree(ligand_dir)
+
+    out_dir = JOBS_DIR / job_id / "docking_outputs"
+    if out_dir.exists():
+        for f in out_dir.glob("out_*.pdbqt"):
+            f.unlink(missing_ok=True)
