@@ -27,8 +27,8 @@ EXHAUSTIVENESS_MAP = {
 
 NUM_MODES      = 3
 ENERGY_RANGE   = 3.0
-BOX_SIZE       = 25.0   # ✅ fixed 25Å — large enough for COX-2 pocket, no dynamic nonsense
-PASS_THRESHOLD = -5.0   # ✅ lowered from -6.0 — Vina scores -5 to -9 for drug-like molecules
+BOX_SIZE       = 25.0
+PASS_THRESHOLD = -5.0
 
 
 def dock_compounds(
@@ -138,12 +138,10 @@ def _dock_single(
             f"Vina failed with code {proc.returncode}:\n{proc.stderr[:500]}"
         )
 
-    # ✅ Regex-based parser — immune to whitespace/format variations
     poses = _parse_vina_output(proc.stdout)
     print(f"[Docking] Parsed {len(poses)} poses from stdout")
 
     if not poses:
-        # ✅ Log and return failed result instead of raising — don't crash whole batch
         print(f"[Docking] WARNING: No poses parsed for compound {compound_index}. Raw stdout tail:")
         print(proc.stdout[-500:])
         return DockingResult(
@@ -168,13 +166,11 @@ def _dock_single(
 
 def _parse_vina_output(stdout: str) -> List[DockingPose]:
     """
-    ✅ Regex-based parser — robust against whitespace, line ending, and
-    format variations across Vina versions.
+    Regex-based parser robust against whitespace variations.
     Matches lines like:
        1       -6.642          0          0
        2       -6.479      23.55      25.65
     """
-    # Pattern: mode_number  affinity  rmsd_lb  rmsd_ub
     pattern = re.compile(
         r"^\s*(\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*$"
     )
@@ -183,7 +179,6 @@ def _parse_vina_output(stdout: str) -> List[DockingPose]:
     in_table = False
 
     for line in stdout.splitlines():
-        # Detect the separator line that precedes the data rows
         if re.match(r"\s*-{5,}\+", line):
             in_table = True
             continue
@@ -195,16 +190,15 @@ def _parse_vina_output(stdout: str) -> List[DockingPose]:
         if m:
             try:
                 poses.append(DockingPose(
-                    pose_number=int(m.group(1)),
+                    rank=int(m.group(1)),
                     affinity_kcal=round(float(m.group(2)), 4),
-                    rmsd_lower=round(float(m.group(3)), 3),
-                    rmsd_upper=round(float(m.group(4)), 3),
+                    rmsd_lb=round(float(m.group(3)), 3),
+                    rmsd_ub=round(float(m.group(4)), 3),
                 ))
             except Exception as e:
-                print(f"[Docking] Parse warning on line '{line}': {e}")
+                print(f"[Docking] Parse warning on line '{line.strip()}': {e}")
                 continue
         elif in_table and line.strip() == "":
-            # blank line after table — stop
             if poses:
                 break
 
