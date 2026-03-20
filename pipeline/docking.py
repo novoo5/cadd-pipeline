@@ -20,20 +20,14 @@ from backend.utils.binding_site import get_binding_site_box
 JOBS_DIR = Path("storage/jobs")
 
 
-# GNINA exhaustiveness values per speed setting
-# ⬇ REDUCED: free HF CPU tier can't handle default values
 EXHAUSTIVENESS_MAP = {
-    DockingSpeed.fast:     2,   # was 8
-    DockingSpeed.balanced: 4,   # was 16
-    DockingSpeed.thorough: 8,   # was 32
+    DockingSpeed.fast:     2,
+    DockingSpeed.balanced: 4,
+    DockingSpeed.thorough: 8,
 }
 
-
-# GNINA docking hard limits
-# ⬇ REDUCED: fewer poses = faster, 1 is enough for scoring
-NUM_MODES        = 3    # was 9
-ENERGY_RANGE     = 3.0  # kcal/mol range from best pose to include
-
+NUM_MODES        = 3
+ENERGY_RANGE     = 3.0
 
 
 def dock_compounds(
@@ -46,14 +40,6 @@ def dock_compounds(
     binding_site_coords: Optional[BindingSiteCoords] = None,
     binding_site_residues: Optional[BindingSiteResidues] = None,
 ) -> Tuple[List[str], List[DockingResult]]:
-    """
-    Runs GNINA docking sequentially for each compound in smiles_list.
-    Sequential (not parallel) to avoid OOM on free HF 16GB RAM tier.
-
-    Returns:
-      - passed_smiles: compounds with best_affinity_kcal < DOCKING_PASS_THRESHOLD
-      - all_results: DockingResult for every compound
-    """
     from backend.models.schemas import BindingSiteMode as BSM
     center, box_size = get_binding_site_box(
         pdb_path=raw_pdb_path,
@@ -95,7 +81,6 @@ def dock_compounds(
     return passed_smiles, all_results
 
 
-
 def _dock_single(
     smiles: str,
     receptor_pdbqt: str,
@@ -107,10 +92,6 @@ def _dock_single(
     box_size: float,
     exhaustiveness: int,
 ) -> DockingResult:
-    """
-    Prepares one ligand and runs GNINA docking against the prepared receptor.
-    Parses GNINA's output log to extract poses, affinities, and CNN scores.
-    """
     ligand_pdbqt = prepare_ligand(smiles, job_id, compound_index)
 
     out_dir = JOBS_DIR / job_id / "docking_outputs"
@@ -118,9 +99,6 @@ def _dock_single(
     out_pdbqt = str(out_dir / f"out_{compound_index}.pdbqt")
     log_file  = str(out_dir / f"log_{compound_index}.txt")
 
-    # ✅ KEY FIX: --cnn_scoring none disables deep learning scoring
-    # This makes GNINA run like fast AutoDock Vina on CPU
-    # --cnn_scoring rescore was the bottleneck causing 0.00 kcal/mol
     cmd = [
         "gnina",
         "--receptor",       receptor_pdbqt,
@@ -136,24 +114,28 @@ def _dock_single(
         "--exhaustiveness", str(exhaustiveness),
         "--num_modes",      str(NUM_MODES),
         "--energy_range",   str(ENERGY_RANGE),
-        "--cnn_scoring",    "none",              # ✅ CHANGED: was "rescore"
+        "--cnn_scoring",    "none",
         "--cpu",            "2",
         "--no_gpu",
     ]
-    # NOTE: removed --cnn crossdock_default2018 since cnn_scoring is now none
 
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,    # ✅ CHANGED: 5 min per compound (was 15 min)
+            timeout=300,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"GNINA timed out after 5 minutes for compound {compound_index}. "
-            "Try using 'Fast' docking speed."
+            f"GNINA timed out after 5 minutes for compound {compound_index}."
         )
+
+    # ===== DEBUG BLOCK - shows in HF Space logs =====
+    print(f"[GNINA returncode]: {proc.returncode}")
+    print(f"[GNINA stdout]: {proc.stdout[:2000]}")
+    print(f"[GNINA stderr]: {proc.stderr[:2000]}")
+    # ===== END DEBUG =====
 
     if proc.returncode != 0:
         raise RuntimeError(
@@ -179,19 +161,7 @@ def _dock_single(
     )
 
 
-
 def _parse_gnina_log(log_file: str) -> List[DockingPose]:
-    """
-    Parses GNINA's text log file to extract pose table.
-
-    GNINA log format (relevant section):
-    -----+------------+----------+----------
-    mode | affinity   | CNN score| dist from best mode
-         | (kcal/mol) |          | rmsd l.b.| rmsd u.b.
-    -----+------------+----------+----------
-       1 |     -8.412 |    0.742 |    0.000 |    0.000
-       2 |     -7.981 |    0.698 |    1.243 |    2.107
-    """
     poses = []
     if not Path(log_file).exists():
         return poses
@@ -217,12 +187,7 @@ def _parse_gnina_log(log_file: str) -> List[DockingPose]:
     return poses
 
 
-
 def _extract_cnn_score(log_file: str) -> float:
-    """
-    Extracts the best CNN pose score from GNINA log.
-    Returns 0.0 if not found (expected when cnn_scoring=none).
-    """
     if not Path(log_file).exists():
         return 0.0
     with open(log_file, "r") as f:
@@ -241,12 +206,7 @@ def _extract_cnn_score(log_file: str) -> float:
     return 0.0
 
 
-
 def cleanup_docking_files(job_id: str) -> None:
-    """
-    Removes intermediate ligand .pdbqt and docking output files after results
-    are saved. Keeps log files for debugging.
-    """
     import shutil
     ligand_dir = JOBS_DIR / job_id / "ligands"
     if ligand_dir.exists():
