@@ -20,7 +20,8 @@ else
 fi
 
 echo "[2/3] Starting ARQ pipeline worker..."
-arq backend.worker.WorkerSettings > /workspace/backend/storage/jobs/arq_worker.log 2>&1 &
+# ✅ FIXED: removed log redirect — ARQ output now shows in HF logs
+arq backend.worker.WorkerSettings &
 echo "      ARQ worker PID: $!"
 sleep 2
 
