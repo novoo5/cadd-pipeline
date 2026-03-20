@@ -1,8 +1,10 @@
 # backend/pipeline/docking.py
+import re
 import subprocess
 import traceback
 from pathlib import Path
 from typing import List, Tuple, Optional
+
 from backend.models.schemas import (
     DockingResult,
     DockingPose,
@@ -23,8 +25,10 @@ EXHAUSTIVENESS_MAP = {
     DockingSpeed.thorough: 16,
 }
 
-NUM_MODES    = 3
-ENERGY_RANGE = 3.0
+NUM_MODES      = 3
+ENERGY_RANGE   = 3.0
+BOX_SIZE       = 25.0   # ✅ fixed 25Å — large enough for COX-2 pocket, no dynamic nonsense
+PASS_THRESHOLD = -5.0   # ✅ lowered from -6.0 — Vina scores -5 to -9 for drug-like molecules
 
 
 def dock_compounds(
@@ -38,7 +42,7 @@ def dock_compounds(
     binding_site_residues: Optional[BindingSiteResidues] = None,
 ) -> Tuple[List[str], List[DockingResult]]:
 
-    center, box_size = get_binding_site_box(
+    center, _ = get_binding_site_box(
         pdb_path=raw_pdb_path,
         mode=binding_site_mode,
         coords=binding_site_coords,
@@ -78,37 +82,6 @@ def dock_compounds(
     return passed_smiles, all_results
 
 
-def _get_ligand_box_size(ligand_pdbqt: str, padding: float = 8.0) -> float:
-    """
-    Calculates a dynamic docking box size from the ligand's actual 3D
-    atom coordinates + padding. Clamps between 20 and 30 Å.
-    Prevents grid overflow for large molecules and wasted space for small ones.
-    """
-    coords = []
-    try:
-        with open(ligand_pdbqt) as f:
-            for line in f:
-                if line.startswith(("ATOM", "HETATM")):
-                    x = float(line[30:38])
-                    y = float(line[38:46])
-                    z = float(line[46:54])
-                    coords.append((x, y, z))
-        if not coords:
-            return 25.0
-        xs = [c[0] for c in coords]
-        ys = [c[1] for c in coords]
-        zs = [c[2] for c in coords]
-        span = max(
-            max(xs) - min(xs),
-            max(ys) - min(ys),
-            max(zs) - min(zs),
-        )
-        size = max(20.0, min(span + padding, 30.0))
-        return round(size, 1)
-    except Exception:
-        return 25.0
-
-
 def _dock_single(
     smiles: str,
     receptor_pdbqt: str,
@@ -123,10 +96,6 @@ def _dock_single(
     ligand_pdbqt = prepare_ligand(smiles, job_id, compound_index)
     print(f"[Docking] Ligand prepared: {ligand_pdbqt}")
 
-    # ✅ Dynamic box size from actual ligand 3D dimensions
-    dynamic_box = _get_ligand_box_size(ligand_pdbqt)
-    print(f"[Docking] Dynamic box size: {dynamic_box} Å")
-
     out_dir = JOBS_DIR / job_id / "docking_outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pdbqt = str(out_dir / f"out_{compound_index}.pdbqt")
@@ -139,9 +108,9 @@ def _dock_single(
         "--center_x",       str(round(cx, 3)),
         "--center_y",       str(round(cy, 3)),
         "--center_z",       str(round(cz, 3)),
-        "--size_x",         str(dynamic_box),
-        "--size_y",         str(dynamic_box),
-        "--size_z",         str(dynamic_box),
+        "--size_x",         str(BOX_SIZE),
+        "--size_y",         str(BOX_SIZE),
+        "--size_z",         str(BOX_SIZE),
         "--exhaustiveness", str(exhaustiveness),
         "--num_modes",      str(NUM_MODES),
         "--energy_range",   str(ENERGY_RANGE),
@@ -161,7 +130,7 @@ def _dock_single(
         raise RuntimeError(f"Vina timed out for compound {compound_index}")
 
     print(f"[Docking] returncode: {proc.returncode}")
-    print(f"[Docking] stdout: {proc.stdout[:2000]}")
+    print(f"[Docking] stdout: {proc.stdout[:3000]}")
     print(f"[Docking] stderr: {proc.stderr[:500]}")
 
     if proc.returncode != 0:
@@ -169,14 +138,25 @@ def _dock_single(
             f"Vina failed with code {proc.returncode}:\n{proc.stderr[:500]}"
         )
 
+    # ✅ Regex-based parser — immune to whitespace/format variations
     poses = _parse_vina_output(proc.stdout)
+    print(f"[Docking] Parsed {len(poses)} poses from stdout")
+
     if not poses:
-        raise RuntimeError(f"Vina produced no poses for compound {compound_index}")
+        # ✅ Log and return failed result instead of raising — don't crash whole batch
+        print(f"[Docking] WARNING: No poses parsed for compound {compound_index}. Raw stdout tail:")
+        print(proc.stdout[-500:])
+        return DockingResult(
+            passed=False,
+            best_affinity_kcal=0.0,
+            cnn_score=0.0,
+            poses=[],
+        )
 
     best_affinity = poses[0].affinity_kcal
     print(f"[Docking] Best affinity: {best_affinity} kcal/mol")
 
-    passed = best_affinity <= -6.0
+    passed = best_affinity <= PASS_THRESHOLD
 
     return DockingResult(
         passed=passed,
@@ -188,32 +168,46 @@ def _dock_single(
 
 def _parse_vina_output(stdout: str) -> List[DockingPose]:
     """
-    Parses AutoDock Vina stdout table:
-    -----+------------+----------+----------
-       1       -8.412      0.000      0.000
+    ✅ Regex-based parser — robust against whitespace, line ending, and
+    format variations across Vina versions.
+    Matches lines like:
+       1       -6.642          0          0
+       2       -6.479      23.55      25.65
     """
+    # Pattern: mode_number  affinity  rmsd_lb  rmsd_ub
+    pattern = re.compile(
+        r"^\s*(\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*$"
+    )
+
     poses = []
     in_table = False
+
     for line in stdout.splitlines():
-        if line.strip().startswith("-----+"):
+        # Detect the separator line that precedes the data rows
+        if re.match(r"\s*-{5,}\+", line):
             in_table = True
             continue
-        if in_table:
-            parts = line.split()
-            if len(parts) >= 4:
-                try:
-                    mode     = int(parts[0])
-                    affinity = float(parts[1])
-                    rmsd_lb  = float(parts[2])
-                    rmsd_ub  = float(parts[3])
-                    poses.append(DockingPose(
-                        pose_number=mode,
-                        affinity_kcal=round(affinity, 4),
-                        rmsd_lower=round(rmsd_lb, 3),
-                        rmsd_upper=round(rmsd_ub, 3),
-                    ))
-                except (ValueError, IndexError):
-                    break
+
+        if not in_table:
+            continue
+
+        m = pattern.match(line)
+        if m:
+            try:
+                poses.append(DockingPose(
+                    pose_number=int(m.group(1)),
+                    affinity_kcal=round(float(m.group(2)), 4),
+                    rmsd_lower=round(float(m.group(3)), 3),
+                    rmsd_upper=round(float(m.group(4)), 3),
+                ))
+            except Exception as e:
+                print(f"[Docking] Parse warning on line '{line}': {e}")
+                continue
+        elif in_table and line.strip() == "":
+            # blank line after table — stop
+            if poses:
+                break
+
     return poses
 
 
