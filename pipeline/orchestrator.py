@@ -24,17 +24,11 @@ from backend.pipeline.scorer import score_and_rank
 from backend.utils.pdb_fetcher import fetch_pdb_by_id, save_pdb_from_content
 from backend.utils.smiles_validator import validate_and_canonicalize
 
+
 JOBS_DIR = Path("storage/jobs")
 
 
 class PipelineOrchestrator:
-    """
-    Master controller for a single pipeline job.
-    Manages status updates, error handling, and step sequencing.
-    All status is written to disk (storage/jobs/{job_id}/) so the
-    FastAPI polling endpoint can read it without any shared memory.
-    """
-
     def __init__(self, job_id: str, request: JobRequest):
         self.job_id  = job_id
         self.request = request
@@ -46,15 +40,14 @@ class PipelineOrchestrator:
         self._init_steps()
 
     def _init_steps(self):
-        """Pre-populate all pipeline steps as 'waiting'."""
         step_names = [
             "Analogue Generation",
             "Drug-likeness Filter (Lipinski + ESOL)",
             "ADMET Toxicity Filter",
             "ML Binding Pre-filter",
             "Protein Preparation",
-            "Molecular Docking (GNINA)",
-            "Retrosynthesis (ASKCOS)",
+            "Molecular Docking (Vina)",
+            "Retrosynthesis (SA Score)",
             "Scoring & Ranking",
         ]
         for name in step_names:
@@ -64,7 +57,6 @@ class PipelineOrchestrator:
     # ── Status helpers ───────────────────────────────────────────────────────
 
     def _write_status(self, status: str, error: Optional[str] = None):
-        """Writes current status to status.json for the polling endpoint."""
         payload = JobStatusResponse(
             job_id=self.job_id,
             status=status,
@@ -99,11 +91,6 @@ class PipelineOrchestrator:
     # ── Main entry point ─────────────────────────────────────────────────────
 
     async def run(self):
-        """
-        Executes the full pipeline in the correct funnel order.
-        Each step reads the survivors from the previous step.
-        Protein prep runs concurrently with ADMET to save wall-clock time.
-        """
         req = self.request
         compound_results: dict[str, CompoundResult] = {}
 
@@ -121,7 +108,6 @@ class PipelineOrchestrator:
                 raise RuntimeError("Analogue generation produced 0 compounds.")
             self._step_done(0, f"{len(analogues)} analogues generated", time.time() - t)
 
-            # Initialize CompoundResult for each analogue
             for smi in analogues:
                 compound_results[smi] = CompoundResult(
                     smiles=smi,
@@ -146,30 +132,22 @@ class PipelineOrchestrator:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
 
             # ── STEP 3 + PROTEIN PREP (concurrent) ───────────────────────────
-            # ADMET filter + protein preparation run at the same time.
-            # Protein prep takes ~20s and is independent of ADMET results.
+            self._step_start(2)
+            self._step_start(4)
 
-            self._step_start(2)  # ADMET
-            self._step_start(4)  # Protein Prep (index 4)
-
-            # Get raw PDB path
             t_pdb = time.time()
             if req.pdb_id:
                 raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
             else:
                 raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
 
-            # Run ADMET and protein prep concurrently
             t_admet = time.time()
-            admet_task   = asyncio.to_thread(run_admet_batch, surviving)
-            protprep_task = asyncio.to_thread(
-                prepare_receptor, raw_pdb_path, self.job_id
-            )
+            admet_task    = asyncio.to_thread(run_admet_batch, surviving)
+            protprep_task = asyncio.to_thread(prepare_receptor, raw_pdb_path, self.job_id)
             (passed_admet, admet_results), receptor_pdbqt = await asyncio.gather(
                 admet_task, protprep_task
             )
 
-            # Store ADMET results
             for smi, result in zip(surviving, admet_results):
                 compound_results[smi].admet = result
             self._step_done(
@@ -192,7 +170,7 @@ class PipelineOrchestrator:
             self._step_start(3)
             if req.pipeline_steps.binding_prefilter:
                 top_smiles, prefilter_results = await asyncio.to_thread(
-                    run_binding_prefilter, surviving, 5
+                    run_binding_prefilter, surviving, 10  # ✅ was 5
                 )
                 for smi, result in zip(surviving, prefilter_results):
                     compound_results[smi].binding_prefilter = result
@@ -204,12 +182,12 @@ class PipelineOrchestrator:
                 surviving = top_smiles
             else:
                 self._step_skip(3)
-                surviving = surviving[:5]  # still cap at 5 for compute sanity
+                surviving = surviving[:10]
 
             if not surviving:
                 raise RuntimeError("No compounds survived the binding pre-filter.")
 
-            # ── STEP 5: GNINA Docking ────────────────────────────────────────
+            # ── STEP 5: Vina Docking ─────────────────────────────────────────
             t = time.time()
             self._step_start(5)
             if req.pipeline_steps.docking:
@@ -239,7 +217,7 @@ class PipelineOrchestrator:
             t = time.time()
             self._step_start(6)
             if req.pipeline_steps.retrosynthesis:
-                top_for_retro = surviving[:3]   # absolute max 3 for compute budget
+                top_for_retro = surviving  # ✅ was surviving[:3], now ALL docked survivors
                 retro_results = await run_retrosynthesis_batch(top_for_retro)
                 for smi, result in zip(top_for_retro, retro_results):
                     compound_results[smi].retrosynthesis = result
@@ -259,7 +237,6 @@ class PipelineOrchestrator:
             ranked = score_and_rank(all_compounds)
             self._step_done(7, f"Ranked {len(ranked)} compounds", time.time() - t)
 
-            # ── Write final results ──────────────────────────────────────────
             self._write_results(ranked, canonical_smiles, len(analogues))
             self._write_status("done")
             cleanup_docking_files(self.job_id)
@@ -280,7 +257,6 @@ class PipelineOrchestrator:
         base_smiles: str,
         total_generated: int,
     ):
-        """Writes the final ranked results to results.json."""
         def _count(attr: str) -> int:
             return sum(
                 1 for c in ranked
