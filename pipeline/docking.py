@@ -30,7 +30,7 @@ ENERGY_RANGE = 3.0
 
 def dock_compounds(
     smiles_list: List[str],
-    receptor_pdbqt: str,
+    receptor_pdb: str,  # ✅ Changed to accept PDB directly
     job_id: str,
     raw_pdb_path: str,
     binding_site_mode: BindingSiteMode,
@@ -56,7 +56,7 @@ def dock_compounds(
         try:
             result = _dock_single(
                 smiles=smi,
-                receptor_pdbqt=receptor_pdbqt,
+                receptor_pdb=receptor_pdb,
                 job_id=job_id,
                 compound_index=idx,
                 cx=cx, cy=cy, cz=cz,
@@ -82,7 +82,7 @@ def dock_compounds(
 
 def _dock_single(
     smiles: str,
-    receptor_pdbqt: str,
+    receptor_pdb: str,
     job_id: str,
     compound_index: int,
     cx: float,
@@ -101,7 +101,7 @@ def _dock_single(
 
     cmd = [
         "vina",
-        "--receptor",       receptor_pdbqt,
+        "--receptor",       receptor_pdb,  # ✅ Vina natively accepts .pdb format
         "--ligand",         ligand_pdbqt,
         "--out",            out_pdbqt,
         "--center_x",       str(round(cx, 3)),
@@ -155,12 +155,6 @@ def _dock_single(
 
 
 def _parse_vina_output(stdout: str) -> List[DockingPose]:
-    """
-    Parses AutoDock Vina stdout. Format:
-    -----+------------+----------+----------
-       1       -8.412      0.000      0.000
-       2       -7.981      1.243      2.107
-    """
     poses = []
     pattern = re.compile(
         r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
