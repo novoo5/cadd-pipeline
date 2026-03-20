@@ -3,6 +3,7 @@ import subprocess
 import os
 import re
 import asyncio
+import traceback
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from backend.models.schemas import (
@@ -70,7 +71,9 @@ def dock_compounds(
                 passed_smiles.append(smi)
 
         except Exception as e:
-            print(f"[Docking] Failed for compound {idx}: {e}")
+            # ✅ FULL traceback so we can see the real crash reason in HF logs
+            print(f"[Docking] FULL ERROR for compound {idx}:")
+            print(traceback.format_exc())
             all_results.append(DockingResult(
                 passed=False,
                 best_affinity_kcal=0.0,
@@ -119,6 +122,8 @@ def _dock_single(
         "--no_gpu",
     ]
 
+    print(f"[GNINA CMD]: {' '.join(cmd)}")
+
     try:
         proc = subprocess.run(
             cmd,
@@ -131,11 +136,9 @@ def _dock_single(
             f"GNINA timed out after 5 minutes for compound {compound_index}."
         )
 
-    # ===== DEBUG BLOCK - shows in HF Space logs =====
     print(f"[GNINA returncode]: {proc.returncode}")
     print(f"[GNINA stdout]: {proc.stdout[:2000]}")
     print(f"[GNINA stderr]: {proc.stderr[:2000]}")
-    # ===== END DEBUG =====
 
     if proc.returncode != 0:
         raise RuntimeError(
