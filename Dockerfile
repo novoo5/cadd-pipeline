@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libssl-dev libffi-dev libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ── GNINA docking binary ──────────────────────────────────────────────────────
-RUN wget -q https://github.com/gnina/gnina/releases/download/v1.3/gnina \
-    -O /usr/local/bin/gnina \
-    && chmod +x /usr/local/bin/gnina
+# ── AutoDock Vina binary (replaces GNINA — CPU safe, no CUDA deps) ────────────
+RUN wget -q https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64 \
+    -O /usr/local/bin/vina \
+    && chmod +x /usr/local/bin/vina
 
 # ── PyTorch (CPU) ─────────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir torch==2.2.2 \
@@ -26,7 +26,6 @@ RUN pip install --no-cache-dir dgl==2.1.0 \
     -f https://data.dgl.ai/wheels/repo.html
 
 # ── Copy requirements and install ─────────────────────────────────────────────
-# Code lives at /workspace/backend so "from backend.x import y" resolves correctly
 WORKDIR /workspace
 COPY requirements.txt .
 RUN pip install --no-cache-dir --use-deprecated=legacy-resolver -r requirements.txt
@@ -34,7 +33,7 @@ RUN pip install --no-cache-dir --use-deprecated=legacy-resolver -r requirements.
 # ── AiZynthFinder model download ──────────────────────────────────────────────
 RUN python -c "from aizynthfinder.tools.download_public_data import main; main('/root/.aizynthfinder')" || echo "[AiZynth] Model download failed — retrosynthesis will use fallback"
 
-# ── Copy application code into /workspace/backend ────────────────────────────
+# ── Copy application code ─────────────────────────────────────────────────────
 COPY . /workspace/backend
 
 # ── Storage and startup ───────────────────────────────────────────────────────

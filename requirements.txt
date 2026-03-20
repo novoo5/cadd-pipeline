@@ -34,4 +34,3 @@ scipy==1.11.4
 # admet-ai → chemprop → descriptastorus → pandas_flavor → xarray
 # xarray >= 2023.9 drops pandas 1.x and causes AttributeError: NumpyExtensionArray
 xarray==2023.6.0
-vina==1.2.3

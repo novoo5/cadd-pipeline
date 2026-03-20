@@ -1,5 +1,5 @@
 # backend/pipeline/docking.py
-import os
+import subprocess
 import re
 import traceback
 from pathlib import Path
@@ -91,7 +91,6 @@ def _dock_single(
     box_size: float,
     exhaustiveness: int,
 ) -> DockingResult:
-    from vina import Vina
 
     ligand_pdbqt = prepare_ligand(smiles, job_id, compound_index)
     print(f"[Docking] Ligand prepared: {ligand_pdbqt}")
@@ -100,49 +99,47 @@ def _dock_single(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pdbqt = str(out_dir / f"out_{compound_index}.pdbqt")
 
-    # Initialize AutoDock Vina
-    v = Vina(sf_name='vina', cpu=2, verbosity=1)
+    cmd = [
+        "vina",
+        "--receptor",       receptor_pdbqt,
+        "--ligand",         ligand_pdbqt,
+        "--out",            out_pdbqt,
+        "--center_x",       str(round(cx, 3)),
+        "--center_y",       str(round(cy, 3)),
+        "--center_z",       str(round(cz, 3)),
+        "--size_x",         str(round(box_size, 1)),
+        "--size_y",         str(round(box_size, 1)),
+        "--size_z",         str(round(box_size, 1)),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes",      str(NUM_MODES),
+        "--energy_range",   str(ENERGY_RANGE),
+        "--cpu",            "2",
+    ]
 
-    print(f"[Docking] Loading receptor: {receptor_pdbqt}")
-    v.set_receptor(receptor_pdbqt)
+    print(f"[Docking] CMD: {' '.join(cmd)}")
 
-    print(f"[Docking] Loading ligand: {ligand_pdbqt}")
-    v.set_ligand_from_file(ligand_pdbqt)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Vina timed out for compound {compound_index}")
 
-    # Define search box
-    v.compute_vina_maps(
-        center=[cx, cy, cz],
-        box_size=[box_size, box_size, box_size],
-    )
+    print(f"[Docking] returncode: {proc.returncode}")
+    print(f"[Docking] stdout: {proc.stdout[:2000]}")
+    print(f"[Docking] stderr: {proc.stderr[:2000]}")
 
-    print(f"[Docking] Running docking with exhaustiveness={exhaustiveness}...")
-    v.dock(exhaustiveness=exhaustiveness, n_poses=NUM_MODES)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Vina failed with code {proc.returncode}:\n{proc.stderr[:500]}"
+        )
 
-    # Get scores
-    energies = v.energies(n_poses=NUM_MODES)
-    print(f"[Docking] Raw energies: {energies}")
-
-    if energies is None or len(energies) == 0:
-        raise RuntimeError(f"Vina returned no poses for compound {compound_index}")
-
-    # Write output
-    v.write_poses(out_pdbqt, n_poses=NUM_MODES, overwrite=True)
-
-    poses = []
-    for i, energy in enumerate(energies):
-        try:
-            poses.append(DockingPose(
-                rank=i + 1,
-                affinity_kcal=float(energy[0]),  # index 0 = total energy
-                rmsd_lb=float(energy[1]) if len(energy) > 1 else 0.0,
-                rmsd_ub=float(energy[2]) if len(energy) > 2 else 0.0,
-            ))
-        except (ValueError, IndexError) as e:
-            print(f"[Docking] Pose parse error at index {i}: {e}")
-            continue
-
+    poses = _parse_vina_output(proc.stdout)
     if not poses:
-        raise RuntimeError(f"Could not parse any poses for compound {compound_index}")
+        raise RuntimeError(f"Vina produced no poses for compound {compound_index}")
 
     best_affinity = poses[0].affinity_kcal
     print(f"[Docking] Best affinity: {best_affinity} kcal/mol")
@@ -152,9 +149,34 @@ def _dock_single(
     return DockingResult(
         passed=passed,
         best_affinity_kcal=round(best_affinity, 4),
-        cnn_score=0.0,  # Vina doesn't have CNN score, that's GNINA-specific
+        cnn_score=0.0,
         poses=poses,
     )
+
+
+def _parse_vina_output(stdout: str) -> List[DockingPose]:
+    """
+    Parses AutoDock Vina stdout. Format:
+    -----+------------+----------+----------
+       1       -8.412      0.000      0.000
+       2       -7.981      1.243      2.107
+    """
+    poses = []
+    pattern = re.compile(
+        r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
+        re.MULTILINE,
+    )
+    for match in pattern.finditer(stdout):
+        try:
+            poses.append(DockingPose(
+                rank=int(match.group(1)),
+                affinity_kcal=float(match.group(2)),
+                rmsd_lb=float(match.group(3)),
+                rmsd_ub=float(match.group(4)),
+            ))
+        except (ValueError, IndexError):
+            continue
+    return poses
 
 
 def cleanup_docking_files(job_id: str) -> None:
