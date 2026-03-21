@@ -32,17 +32,27 @@ class BindingSiteResidues(BaseModel):
     residue_end: int
 
 
+# ✅ NEW — carries detected binding site info to the frontend
+class BindingSiteInfo(BaseModel):
+    detection_mode: str                         # "native_ligand" | "protein_centroid" | "user_coordinates" | "user_residues"
+    detected_ligand_name: Optional[str] = None  # e.g. "G39", "STI", "LIG"
+    center_x: float
+    center_y: float
+    center_z: float
+    box_size: float
+
+
 class DockingSpeed(str, Enum):
-    fast = "fast"          # exhaustiveness=8
-    balanced = "balanced"  # exhaustiveness=16
-    thorough = "thorough"  # exhaustiveness=32
+    fast     = "fast"
+    balanced = "balanced"
+    thorough = "thorough"
 
 
 class JobRequest(BaseModel):
     smiles: str = Field(..., description="SMILES string of the base compound")
-    pdb_id: Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC). Either this or pdb_content required.")
+    pdb_id: Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC).")
     pdb_content: Optional[str] = Field(None, description="Raw .pdb file content as string if uploaded directly")
-    num_analogues: Literal[10, 25, 50] = Field(25, description="Number of analogues to generate")
+    num_analogues: Literal[10, 25, 50] = Field(25)
     pipeline_steps: PipelineSteps = Field(default_factory=PipelineSteps)
     binding_site_mode: BindingSiteMode = BindingSiteMode.auto
     binding_site_coords: Optional[BindingSiteCoords] = None
@@ -63,26 +73,24 @@ class JobRequest(BaseModel):
         if v is not None:
             v = v.strip().upper()
             if len(v) != 4 or not v.isalnum():
-                raise ValueError("PDB ID must be exactly 4 alphanumeric characters (e.g. '1ABC')")
+                raise ValueError("PDB ID must be exactly 4 alphanumeric characters")
         return v
 
     def model_post_init(self, __context: Any) -> None:
         if self.pdb_id is None and self.pdb_content is None:
             raise ValueError("Either pdb_id or pdb_content must be provided")
         if self.binding_site_mode == BindingSiteMode.coordinates and self.binding_site_coords is None:
-            raise ValueError("binding_site_coords required when binding_site_mode is 'coordinates'")
+            raise ValueError("binding_site_coords required when mode is 'coordinates'")
         if self.binding_site_mode == BindingSiteMode.residues and self.binding_site_residues is None:
-            raise ValueError("binding_site_residues required when binding_site_mode is 'residues'")
+            raise ValueError("binding_site_residues required when mode is 'residues'")
 
-
-# ── Step-level status tracking ──────────────────────────────────────────────
 
 class StepStatus(str, Enum):
     waiting = "waiting"
     running = "running"
-    done = "done"
+    done    = "done"
     skipped = "skipped"
-    failed = "failed"
+    failed  = "failed"
 
 
 class PipelineStepInfo(BaseModel):
@@ -101,32 +109,30 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
-# ── Per-compound results ─────────────────────────────────────────────────────
-
 class LipinskiResult(BaseModel):
     passed: bool
-    mw: float                    # Molecular Weight
-    logp: float                  # Lipophilicity
-    hbd: int                     # H-bond donors
-    hba: int                     # H-bond acceptors
-    logs: float                  # Log solubility (ESOL)
-    solubility_class: str        # "High" / "Medium" / "Low" / "Very Low"
+    mw: float
+    logp: float
+    hbd: int
+    hba: int
+    logs: float
+    solubility_class: str
 
 
 class ADMETResult(BaseModel):
-    passed: bool                 # True if no hard-fail flags
-    herg_inhibition: float       # Probability 0–1 (>0.5 = risky)
-    caco2_permeability: float    # cm/s log scale
-    bbb_penetration: float       # Probability 0–1
-    hepatotoxicity: float        # Probability 0–1
-    oral_bioavailability: float  # Probability 0–1
-    flags: List[str]             # e.g. ["High hERG risk", "Hepatotoxic"]
+    passed: bool
+    herg_inhibition: float
+    caco2_permeability: float
+    bbb_penetration: float
+    hepatotoxicity: float
+    oral_bioavailability: float
+    flags: List[str]
 
 
 class BindingPrefilterResult(BaseModel):
     passed: bool
-    predicted_affinity_kcal: float    # GNN-predicted, lower = stronger binding
-    confidence: float                  # Model confidence 0–1
+    predicted_affinity_kcal: float
+    confidence: float
 
 
 class DockingPose(BaseModel):
@@ -139,7 +145,7 @@ class DockingPose(BaseModel):
 class DockingResult(BaseModel):
     passed: bool
     best_affinity_kcal: float
-    cnn_score: float              # GNINA CNN pose quality score
+    cnn_score: float
     poses: List[DockingPose]
 
 
@@ -154,15 +160,14 @@ class RetrosynthesisResult(BaseModel):
     feasible: bool
     num_steps: int
     route: List[RetrosynthesisStep]
-    complexity_score: float       # custom weighted score (steps + rarity of materials)
+    complexity_score: float
 
 
 class CompoundResult(BaseModel):
     smiles: str
     canonical_smiles: str
     rank: Optional[int] = None
-    final_score: Optional[float] = None    # 0–100 weighted composite
-
+    final_score: Optional[float] = None
     lipinski: Optional[LipinskiResult] = None
     admet: Optional[ADMETResult] = None
     binding_prefilter: Optional[BindingPrefilterResult] = None
@@ -179,11 +184,10 @@ class JobResultsResponse(BaseModel):
     compounds_after_prefilter: int
     compounds_docked: int
     final_ranked_compounds: List[CompoundResult]
+    binding_site_info: Optional[BindingSiteInfo] = None   # ✅ NEW
     created_at: datetime
     completed_at: datetime
 
-
-# ── Job submission response ──────────────────────────────────────────────────
 
 class JobSubmitResponse(BaseModel):
     job_id: str

@@ -1,4 +1,3 @@
-# backend/pipeline/docking.py
 import re
 import subprocess
 import traceback
@@ -12,6 +11,7 @@ from backend.models.schemas import (
     BindingSiteMode,
     BindingSiteCoords,
     BindingSiteResidues,
+    BindingSiteInfo,
 )
 from backend.pipeline.protein_prep import prepare_ligand
 from backend.utils.binding_site import get_binding_site_box
@@ -27,7 +27,7 @@ EXHAUSTIVENESS_MAP = {
 
 NUM_MODES      = 3
 ENERGY_RANGE   = 3.0
-BOX_SIZE       = 35.0
+BOX_SIZE       = 25.0
 PASS_THRESHOLD = -5.0
 
 
@@ -40,9 +40,10 @@ def dock_compounds(
     docking_speed: DockingSpeed,
     binding_site_coords: Optional[BindingSiteCoords] = None,
     binding_site_residues: Optional[BindingSiteResidues] = None,
-) -> Tuple[List[str], List[DockingResult]]:
+) -> Tuple[List[str], List[DockingResult], BindingSiteInfo]:  # ✅ now returns 3-tuple
 
-    center, _ = get_binding_site_box(
+    # ✅ unpack 3-tuple — center, box_size, info
+    center, _, binding_site_info = get_binding_site_box(
         pdb_path=raw_pdb_path,
         mode=binding_site_mode,
         coords=binding_site_coords,
@@ -79,7 +80,7 @@ def dock_compounds(
                 poses=[],
             ))
 
-    return passed_smiles, all_results
+    return passed_smiles, all_results, binding_site_info
 
 
 def _dock_single(
@@ -120,12 +121,7 @@ def _dock_single(
     print(f"[Docking] CMD: {' '.join(cmd)}")
 
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Vina timed out for compound {compound_index}")
 
@@ -134,30 +130,21 @@ def _dock_single(
     print(f"[Docking] stderr: {proc.stderr[:500]}")
 
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"Vina failed with code {proc.returncode}:\n{proc.stderr[:500]}"
-        )
+        raise RuntimeError(f"Vina failed with code {proc.returncode}:\n{proc.stderr[:500]}")
 
     poses = _parse_vina_output(proc.stdout)
     print(f"[Docking] Parsed {len(poses)} poses from stdout")
 
     if not poses:
-        print(f"[Docking] WARNING: No poses parsed for compound {compound_index}. Raw stdout tail:")
+        print(f"[Docking] WARNING: No poses for compound {compound_index}.")
         print(proc.stdout[-500:])
-        return DockingResult(
-            passed=False,
-            best_affinity_kcal=0.0,
-            cnn_score=0.0,
-            poses=[],
-        )
+        return DockingResult(passed=False, best_affinity_kcal=0.0, cnn_score=0.0, poses=[])
 
     best_affinity = poses[0].affinity_kcal
     print(f"[Docking] Best affinity: {best_affinity} kcal/mol")
 
-    passed = best_affinity <= PASS_THRESHOLD
-
     return DockingResult(
-        passed=passed,
+        passed=best_affinity <= PASS_THRESHOLD,
         best_affinity_kcal=round(best_affinity, 4),
         cnn_score=0.0,
         poses=poses,
@@ -165,16 +152,9 @@ def _dock_single(
 
 
 def _parse_vina_output(stdout: str) -> List[DockingPose]:
-    """
-    Regex-based parser robust against whitespace variations.
-    Matches lines like:
-       1       -6.642          0          0
-       2       -6.479      23.55      25.65
-    """
     pattern = re.compile(
         r"^\s*(\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*$"
     )
-
     poses = []
     in_table = False
 
@@ -182,10 +162,8 @@ def _parse_vina_output(stdout: str) -> List[DockingPose]:
         if re.match(r"\s*-{5,}\+", line):
             in_table = True
             continue
-
         if not in_table:
             continue
-
         m = pattern.match(line)
         if m:
             try:
@@ -210,7 +188,6 @@ def cleanup_docking_files(job_id: str) -> None:
     ligand_dir = JOBS_DIR / job_id / "ligands"
     if ligand_dir.exists():
         shutil.rmtree(ligand_dir)
-
     out_dir = JOBS_DIR / job_id / "docking_outputs"
     if out_dir.exists():
         for f in out_dir.glob("out_*.pdbqt"):
