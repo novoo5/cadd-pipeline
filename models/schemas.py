@@ -32,10 +32,9 @@ class BindingSiteResidues(BaseModel):
     residue_end: int
 
 
-# ✅ NEW — carries detected binding site info to the frontend
 class BindingSiteInfo(BaseModel):
-    detection_mode: str                         # "native_ligand" | "protein_centroid" | "user_coordinates" | "user_residues"
-    detected_ligand_name: Optional[str] = None  # e.g. "G39", "STI", "LIG"
+    detection_mode: str
+    detected_ligand_name: Optional[str] = None
     center_x: float
     center_y: float
     center_z: float
@@ -52,7 +51,8 @@ class JobRequest(BaseModel):
     smiles: str = Field(..., description="SMILES string of the base compound")
     pdb_id: Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC).")
     pdb_content: Optional[str] = Field(None, description="Raw .pdb file content as string if uploaded directly")
-    num_analogues: Literal[10, 25, 50] = Field(25)
+    num_analogues: Literal[0, 10, 25, 50] = Field(25)
+    direct_score_only: bool = Field(False, description="Skip analogue generation; score the input compound directly")
     pipeline_steps: PipelineSteps = Field(default_factory=PipelineSteps)
     binding_site_mode: BindingSiteMode = BindingSiteMode.auto
     binding_site_coords: Optional[BindingSiteCoords] = None
@@ -83,6 +83,8 @@ class JobRequest(BaseModel):
             raise ValueError("binding_site_coords required when mode is 'coordinates'")
         if self.binding_site_mode == BindingSiteMode.residues and self.binding_site_residues is None:
             raise ValueError("binding_site_residues required when mode is 'residues'")
+        if self.direct_score_only:
+            object.__setattr__(self, "num_analogues", 0)
 
 
 class StepStatus(str, Enum):
@@ -184,7 +186,7 @@ class JobResultsResponse(BaseModel):
     compounds_after_prefilter: int
     compounds_docked: int
     final_ranked_compounds: List[CompoundResult]
-    binding_site_info: Optional[BindingSiteInfo] = None   # ✅ NEW
+    binding_site_info: Optional[BindingSiteInfo] = None
     created_at: datetime
     completed_at: datetime
 

@@ -6,9 +6,11 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+
 from backend.models.schemas import JobRequest, JobSubmitResponse
 from backend.routers import jobs, health
 from backend.worker import enqueue_job
+
 
 JOBS_DIR = Path("storage/jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -16,7 +18,6 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
     print("[CADD] Backend starting up...")
     yield
     print("[CADD] Backend shutting down...")
@@ -33,8 +34,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS ─────────────────────────────────────────────────────────────────────
-# Allow Vercel frontend and local dev
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -47,6 +48,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(jobs.router,   prefix="/api/v1", tags=["Jobs"])
@@ -68,22 +70,19 @@ async def root():
 @app.post("/api/v1/jobs", response_model=JobSubmitResponse)
 async def submit_job(request: JobRequest):
     """
-    Submit a new pipeline job.
-    Accepts a JSON body with SMILES + PDB ID (or pdb_content).
-    Returns a job_id immediately; pipeline runs in the background.
+    Submit a new pipeline job via JSON body.
+    Pass "direct_score_only": true to skip analogue generation and score
+    the input SMILES directly through the full pipeline as a single compound.
     """
     job_id = str(uuid.uuid4())
 
-    # Save the raw request for the worker to re-read
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    request_path = job_dir / "request.json"
-    request_path.write_text(request.model_dump_json(indent=2))
+    (job_dir / "request.json").write_text(request.model_dump_json(indent=2))
 
-    # Enqueue the job into the ARQ background worker
     await enqueue_job(job_id, request.model_dump())
 
-    base_url = "https://your-hf-space.hf.space"   # update after HF deploy
+    base_url = "https://your-hf-space.hf.space"
     return JobSubmitResponse(
         job_id=job_id,
         message="Job queued successfully. Use the status URL to track progress.",
@@ -99,12 +98,13 @@ async def submit_job_with_file(
     num_analogues: int = Form(25),
     docking_speed: str = Form("balanced"),
     binding_site_mode: str = Form("auto"),
+    direct_score_only: bool = Form(False),   # ← NEW
     pdb_id: str = Form(None),
     pdb_file: UploadFile = File(None),
 ):
     """
-    Alternative submission endpoint for when the user uploads a .pdb file
-    directly from the frontend (multipart/form-data).
+    Alternative submission for .pdb file uploads (multipart/form-data).
+    Set direct_score_only=true to bypass analogue generation.
     """
     if pdb_id is None and pdb_file is None:
         raise HTTPException(
@@ -127,15 +127,14 @@ async def submit_job_with_file(
                 detail="Uploaded PDB file appears to be empty or too small.",
             )
 
-    # Build a JobRequest from form fields
-    from backend.models.schemas import (
-        PipelineSteps, BindingSiteMode, DockingSpeed
-    )
+    from backend.models.schemas import PipelineSteps, BindingSiteMode, DockingSpeed
+
     request = JobRequest(
         smiles=smiles,
         pdb_id=pdb_id,
         pdb_content=pdb_content,
-        num_analogues=num_analogues,  # type: ignore
+        num_analogues=0 if direct_score_only else num_analogues,  # ← CHANGED
+        direct_score_only=direct_score_only,                       # ← NEW
         pipeline_steps=PipelineSteps(),
         binding_site_mode=BindingSiteMode(binding_site_mode),
         docking_speed=DockingSpeed(docking_speed),
@@ -144,8 +143,7 @@ async def submit_job_with_file(
     job_id = str(uuid.uuid4())
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    request_path = job_dir / "request.json"
-    request_path.write_text(request.model_dump_json(indent=2))
+    (job_dir / "request.json").write_text(request.model_dump_json(indent=2))
 
     await enqueue_job(job_id, request.model_dump())
 

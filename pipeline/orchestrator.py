@@ -89,10 +89,19 @@ class PipelineOrchestrator:
             # ── STEP 1: Analogue Generation ──────────────────────────────────
             t = time.time()
             self._step_start(0)
-            analogues = generate_analogues(canonical_smiles, req.num_analogues)
-            if not analogues:
-                raise RuntimeError("Analogue generation produced 0 compounds.")
-            self._step_done(0, f"{len(analogues)} analogues generated", time.time() - t)
+
+            if req.direct_score_only:
+                analogues = [canonical_smiles]
+                self._step_done(
+                    0,
+                    "Direct scoring mode — input compound scored as-is (no analogues generated)",
+                    time.time() - t,
+                )
+            else:
+                analogues = generate_analogues(canonical_smiles, req.num_analogues)
+                if not analogues:
+                    raise RuntimeError("Analogue generation produced 0 compounds.")
+                self._step_done(0, f"{len(analogues)} analogues generated", time.time() - t)
 
             for smi in analogues:
                 compound_results[smi] = CompoundResult(smiles=smi, canonical_smiles=smi)
@@ -114,7 +123,6 @@ class PipelineOrchestrator:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
 
             # ── STEP 3: ADMET + STEP 5: Protein Prep (concurrent) ────────────
-            # Protein prep always runs regardless of ADMET toggle
             t_pdb = time.time()
             self._step_start(4)
             if req.pdb_id:
@@ -123,7 +131,6 @@ class PipelineOrchestrator:
                 raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
 
             if req.pipeline_steps.admet:
-                # ✅ FIX: was always running ADMET unconditionally — now gated
                 self._step_start(2)
                 t_admet = time.time()
                 admet_task    = asyncio.to_thread(run_admet_batch, surviving)
@@ -139,7 +146,6 @@ class PipelineOrchestrator:
                 self._step_done(4, f"Receptor prepared → {Path(receptor_pdbqt).name}", time.time() - t_pdb)
                 surviving = passed_admet
             else:
-                # ADMET skipped — run protein prep alone
                 self._step_skip(2)
                 receptor_pdbqt = await asyncio.to_thread(prepare_receptor, raw_pdb_path, self.job_id)
                 self._step_done(4, f"Receptor prepared → {Path(receptor_pdbqt).name}", time.time() - t_pdb)
