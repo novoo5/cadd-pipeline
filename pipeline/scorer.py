@@ -13,17 +13,12 @@ WEIGHTS = {
 
 assert sum(WEIGHTS.values()) == 100, "Scoring weights must sum to 100"
 
-# ── Affinity range (realistic for Vina on drug-sized compounds) ──────────────
-# FIX: was -12/-4 — too wide, making real scores compress into bottom 25%
-AFFINITY_BEST  = -10.0   # excellent binding
-AFFINITY_WORST =  -3.0   # poor binding (anything weaker = 0 pts)
+AFFINITY_BEST  = -10.0
+AFFINITY_WORST =  -3.0
 
-# ── Complexity range (matches actual SA-derived values ~20–60) ───────────────
-# FIX: was 2/30 — actual data shows 37–42, so everything was clamping to 10pts
-COMPLEXITY_BEST  = 20.0   # simple to synthesise
-COMPLEXITY_WORST = 60.0   # very hard to synthesise
+COMPLEXITY_BEST  = 20.0
+COMPLEXITY_WORST = 60.0
 
-# ── Solubility scores ────────────────────────────────────────────────────────
 SOLUBILITY_SCORES = {
     "High":      1.0,
     "Medium":    0.7,
@@ -32,8 +27,7 @@ SOLUBILITY_SCORES = {
     "Invalid":   0.0,
 }
 
-# ── Minimum MW guard — penalise tiny fragments that pass Lipinski trivially ──
-MW_MIN = 200.0   # anything below gets a 0.5× score multiplier
+MW_MIN = 200.0
 
 
 def score_and_rank(compounds: List[CompoundResult]) -> List[CompoundResult]:
@@ -61,7 +55,6 @@ def _compute_score(c: CompoundResult) -> float:
         num_flags = len(c.admet.flags)
         safety_scores = {0: 1.0, 1: 0.6, 2: 0.3}
         norm = safety_scores.get(num_flags, 0.0)
-        # hERG penalty: only kicks in above 0.3 threshold
         herg_penalty = max(0.0, c.admet.herg_inhibition - 0.3) * 2.0
         norm = max(0.0, norm - herg_penalty)
         total += norm * WEIGHTS["admet_safety"]
@@ -72,31 +65,25 @@ def _compute_score(c: CompoundResult) -> float:
         total += sol_norm * WEIGHTS["solubility"]
 
     # ── 4. Binding prefilter GNN score (10 pts) ───────────────────────────────
-    # FIX: don't multiply by confidence — it artificially caps this at ~5–8pts.
-    # Instead, only use prefilter if confidence >= 0.4; treat it as 0 otherwise.
     if c.binding_prefilter and c.binding_prefilter.confidence >= 0.4:
         pre = c.binding_prefilter.predicted_affinity_kcal
         norm = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
         total += norm * WEIGHTS["binding_prefilter"]
 
     # ── 5. Synthesis ease (10 pts) ────────────────────────────────────────────
-    # FIX: removed invert=True — direction is handled by worst > best
     if c.retrosynthesis and c.retrosynthesis.feasible:
         comp = c.retrosynthesis.complexity_score
         norm = _normalize(comp, COMPLEXITY_WORST, COMPLEXITY_BEST)
         total += norm * WEIGHTS["synthesis_ease"]
-    # infeasible or missing → 0 pts (no else needed)
 
     # ── MW fragment penalty ───────────────────────────────────────────────────
-    # Tiny fragments (MW < 200) trivially pass Lipinski + ADMET — penalise them
-    if c.lipinski and c.lipinski.molecular_weight < MW_MIN:
+    if c.lipinski and c.lipinski.mw < MW_MIN:
         total *= 0.5
 
     return round(min(max(total, 0.0), 100.0), 2)
 
 
 def _normalize(value: float, worst: float, best: float) -> float:
-    """Normalise value to [0, 1]. worst → 0.0, best → 1.0."""
     if best == worst:
         return 0.0
     norm = (value - worst) / (best - worst)
@@ -161,9 +148,7 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
                 "max_possible": WEIGHTS["synthesis_ease"],
             }
 
-    mw_penalty_applied = (
-        c.lipinski and c.lipinski.molecular_weight < MW_MIN
-    )
+    mw_penalty_applied = (c.lipinski and c.lipinski.mw < MW_MIN)
     breakdown["mw_fragment_penalty"] = mw_penalty_applied
     breakdown["final_score"] = c.final_score
     return breakdown
