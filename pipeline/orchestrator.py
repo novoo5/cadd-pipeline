@@ -79,7 +79,7 @@ class PipelineOrchestrator:
     async def run(self):
         req = self.request
         compound_results: dict[str, CompoundResult] = {}
-        binding_site_info: Optional[BindingSiteInfo] = None  # ✅
+        binding_site_info: Optional[BindingSiteInfo] = None
 
         try:
             is_valid, canonical_smiles, err = validate_and_canonicalize(req.smiles)
@@ -113,26 +113,36 @@ class PipelineOrchestrator:
             if not surviving:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
 
-            # ── STEP 3 + PROTEIN PREP (concurrent) ───────────────────────────
-            self._step_start(2)
-            self._step_start(4)
-
+            # ── STEP 3: ADMET + STEP 5: Protein Prep (concurrent) ────────────
+            # Protein prep always runs regardless of ADMET toggle
             t_pdb = time.time()
+            self._step_start(4)
             if req.pdb_id:
                 raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
             else:
                 raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
 
-            t_admet = time.time()
-            admet_task    = asyncio.to_thread(run_admet_batch, surviving)
-            protprep_task = asyncio.to_thread(prepare_receptor, raw_pdb_path, self.job_id)
-            (passed_admet, admet_results), receptor_pdbqt = await asyncio.gather(admet_task, protprep_task)
-
-            for smi, result in zip(surviving, admet_results):
-                compound_results[smi].admet = result
-            self._step_done(2, f"{len(passed_admet)}/{len(surviving)} passed ADMET", time.time() - t_admet)
-            self._step_done(4, f"Receptor prepared → {Path(receptor_pdbqt).name}", time.time() - t_pdb)
-            surviving = passed_admet
+            if req.pipeline_steps.admet:
+                # ✅ FIX: was always running ADMET unconditionally — now gated
+                self._step_start(2)
+                t_admet = time.time()
+                admet_task    = asyncio.to_thread(run_admet_batch, surviving)
+                protprep_task = asyncio.to_thread(prepare_receptor, raw_pdb_path, self.job_id)
+                (passed_admet, admet_results), receptor_pdbqt = await asyncio.gather(
+                    admet_task, protprep_task
+                )
+                for smi, result in zip(surviving, admet_results):
+                    compound_results[smi].admet = result
+                self._step_done(
+                    2, f"{len(passed_admet)}/{len(surviving)} passed ADMET", time.time() - t_admet
+                )
+                self._step_done(4, f"Receptor prepared → {Path(receptor_pdbqt).name}", time.time() - t_pdb)
+                surviving = passed_admet
+            else:
+                # ADMET skipped — run protein prep alone
+                self._step_skip(2)
+                receptor_pdbqt = await asyncio.to_thread(prepare_receptor, raw_pdb_path, self.job_id)
+                self._step_done(4, f"Receptor prepared → {Path(receptor_pdbqt).name}", time.time() - t_pdb)
 
             if not surviving:
                 raise RuntimeError("No compounds survived the ADMET filter.")
@@ -159,7 +169,6 @@ class PipelineOrchestrator:
             t = time.time()
             self._step_start(5)
             if req.pipeline_steps.docking:
-                # ✅ unpack 3-tuple now
                 passed_docking, docking_results, binding_site_info = await asyncio.to_thread(
                     dock_compounds,
                     surviving, receptor_pdbqt, self.job_id, raw_pdb_path,
@@ -214,7 +223,7 @@ class PipelineOrchestrator:
         ranked: list[CompoundResult],
         base_smiles: str,
         total_generated: int,
-        binding_site_info: Optional[BindingSiteInfo] = None,  # ✅
+        binding_site_info: Optional[BindingSiteInfo] = None,
     ):
         def _count(attr: str) -> int:
             return sum(
@@ -231,7 +240,7 @@ class PipelineOrchestrator:
             compounds_after_prefilter=_count("binding_prefilter"),
             compounds_docked=_count("docking"),
             final_ranked_compounds=ranked,
-            binding_site_info=binding_site_info,  # ✅
+            binding_site_info=binding_site_info,
             created_at=self.created_at,
             completed_at=datetime.now(timezone.utc),
         )
