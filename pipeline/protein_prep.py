@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from typing import Tuple, Optional
 
+
 try:
     from pdbfixer import PDBFixer
     from openmm.app import PDBFile
@@ -10,7 +11,6 @@ try:
 except ImportError:
     _PDBFIXER_AVAILABLE = False
 
-_MEEKO_AVAILABLE = False
 
 JOBS_DIR = Path("storage/jobs")
 
@@ -82,7 +82,8 @@ def _strip_waters_and_hetatm(input_pdb: str, output_pdb: str) -> None:
     """
     Strips ALL HETATM records (ligands, cofactors, waters) from PDB.
     Keeps only ATOM records (protein backbone).
-    This prevents obabel kekulization failures on unusual small molecules.
+    NOTE: Binding site coordinates are computed from raw_pdb_path BEFORE
+    this step runs, so stripping here does NOT affect auto-boxing accuracy.
     """
     water_res = {"HOH", "WAT", "DOD"}
     lines_out = []
@@ -92,8 +93,7 @@ def _strip_waters_and_hetatm(input_pdb: str, output_pdb: str) -> None:
             if record == "HETATM":
                 continue
             if record == "ATOM":
-                res_name = line[17:20].strip()
-                if res_name in water_res:
+                if line[17:20].strip() in water_res:
                     continue
             lines_out.append(line)
 
@@ -106,8 +106,8 @@ def _strip_waters_and_hetatm(input_pdb: str, output_pdb: str) -> None:
 def _convert_pdb_to_pdbqt(input_pdb: str, output_pdbqt: str) -> None:
     cmd = [
         "obabel",
-        input_pdb,   # ✅ input file FIRST
-        "-e",        # ✅ -e flag AFTER input (obabel rule: most flags after input)
+        input_pdb,
+        "-e",
         "-O", output_pdbqt,
         "-xr",
         "--partialcharge", "gasteiger",
