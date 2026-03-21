@@ -42,13 +42,14 @@ def score_and_rank(compounds: List[CompoundResult]) -> List[CompoundResult]:
 
 
 def _compute_score(c: CompoundResult) -> float:
-    total = 0.0
+    earned = 0.0
+    possible = 0.0
 
     # ── 1. Docking affinity (50 pts) ─────────────────────────────────────────
     if c.docking and c.docking.best_affinity_kcal != 0.0:
         aff = c.docking.best_affinity_kcal
-        norm = _normalize(aff, AFFINITY_WORST, AFFINITY_BEST)
-        total += norm * WEIGHTS["docking_affinity"]
+        earned += _normalize(aff, AFFINITY_WORST, AFFINITY_BEST) * WEIGHTS["docking_affinity"]
+        possible += WEIGHTS["docking_affinity"]
 
     # ── 2. ADMET safety (20 pts) ──────────────────────────────────────────────
     if c.admet:
@@ -57,30 +58,43 @@ def _compute_score(c: CompoundResult) -> float:
         norm = safety_scores.get(num_flags, 0.0)
         herg_penalty = max(0.0, c.admet.herg_inhibition - 0.3) * 2.0
         norm = max(0.0, norm - herg_penalty)
-        total += norm * WEIGHTS["admet_safety"]
+        earned += norm * WEIGHTS["admet_safety"]
+        possible += WEIGHTS["admet_safety"]
 
-    # ── 3. Solubility (10 pts) ────────────────────────────────────────────────
+    # ── 3. Solubility (10 pts) — always runs, drug-likeness is locked on ──────
     if c.lipinski:
         sol_norm = SOLUBILITY_SCORES.get(c.lipinski.solubility_class, 0.0)
-        total += sol_norm * WEIGHTS["solubility"]
+        earned += sol_norm * WEIGHTS["solubility"]
+        possible += WEIGHTS["solubility"]
 
     # ── 4. Binding prefilter GNN score (10 pts) ───────────────────────────────
     if c.binding_prefilter and c.binding_prefilter.confidence >= 0.4:
         pre = c.binding_prefilter.predicted_affinity_kcal
         norm = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
-        total += norm * WEIGHTS["binding_prefilter"]
+        earned += norm * WEIGHTS["binding_prefilter"]
+        possible += WEIGHTS["binding_prefilter"]
 
     # ── 5. Synthesis ease (10 pts) ────────────────────────────────────────────
     if c.retrosynthesis and c.retrosynthesis.feasible:
         comp = c.retrosynthesis.complexity_score
         norm = _normalize(comp, COMPLEXITY_WORST, COMPLEXITY_BEST)
-        total += norm * WEIGHTS["synthesis_ease"]
+        earned += norm * WEIGHTS["synthesis_ease"]
+        possible += WEIGHTS["synthesis_ease"]
+    elif c.retrosynthesis and not c.retrosynthesis.feasible:
+        # ran but infeasible — penalise but count it as attempted
+        possible += WEIGHTS["synthesis_ease"]
+
+    if possible == 0.0:
+        return 0.0
+
+    # ── Dynamic reweighting: scale to 100 based on which steps ran ───────────
+    scaled = (earned / possible) * 100.0
 
     # ── MW fragment penalty ───────────────────────────────────────────────────
     if c.lipinski and c.lipinski.mw < MW_MIN:
-        total *= 0.5
+        scaled *= 0.5
 
-    return round(min(max(total, 0.0), 100.0), 2)
+    return round(min(max(scaled, 0.0), 100.0), 2)
 
 
 def _normalize(value: float, worst: float, best: float) -> float:
