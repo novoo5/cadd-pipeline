@@ -1,7 +1,9 @@
 import uuid
 import json
+import time
 from pathlib import Path
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,6 +16,46 @@ from backend.worker import enqueue_job
 JOBS_DIR = Path("storage/jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ── Helper: write queued status.json before ARQ picks it up ──────────────────
+
+def _write_initial_status(job_id: str, request: JobRequest):
+    """
+    Writes status.json immediately at submission time so /status never 404s
+    while the job is sitting in the ARQ queue waiting for a worker slot.
+    Without this, jobs returning 404 when queue has 3+ jobs ahead.
+    """
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Build the step list — mark skipped steps based on pipeline_steps config
+    ps = request.pipeline_steps
+    steps = [
+        {"name": "Drug-likeness Filter", "status": "waiting"},
+        {"name": "ADMET Toxicity Filter", "status": "waiting" if ps.admet else "skipped"},
+        {"name": "ML Binding Pre-filter", "status": "waiting" if ps.binding_prefilter else "skipped"},
+        {"name": "Protein Preparation",   "status": "waiting" if ps.docking else "skipped"},
+        {"name": "Molecular Docking",     "status": "waiting" if ps.docking else "skipped"},
+        {"name": "Retrosynthesis",        "status": "waiting" if ps.retrosynthesis else "skipped"},
+        {"name": "Scoring & Ranking",     "status": "waiting"},
+    ]
+
+    status_payload = {
+        "job_id":     job_id,
+        "status":     "queued",
+        "created_at": now,
+        "updated_at": now,
+        "steps":      steps,
+        "error":      None,
+    }
+
+    (job_dir / "status.json").write_text(json.dumps(status_payload, indent=2))
+    (job_dir / "request.json").write_text(request.model_dump_json(indent=2))
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,13 +117,15 @@ async def submit_job(request: JobRequest):
     """
     job_id = str(uuid.uuid4())
 
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "request.json").write_text(request.model_dump_json(indent=2))
+    # ✅ Write status.json BEFORE enqueuing — fixes 404 race condition
+    # Previously: only request.json was written here, status.json was created
+    # by the orchestrator only after the worker picked it up. With a full queue
+    # (3+ jobs ahead), the frontend would hit /status, get 404, and give up.
+    _write_initial_status(job_id, request)
 
     await enqueue_job(job_id, request.model_dump())
 
-    base_url = "https://your-hf-space.hf.space"
+    base_url = "https://novoo5-cadd-backend.hf.space"
     return JobSubmitResponse(
         job_id=job_id,
         message="Job queued successfully. Use the status URL to track progress.",
@@ -145,13 +189,13 @@ async def submit_job_with_file(
     )
 
     job_id = str(uuid.uuid4())
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "request.json").write_text(request.model_dump_json(indent=2))
+
+    # ✅ Write status.json BEFORE enqueuing — same fix as JSON endpoint
+    _write_initial_status(job_id, request)
 
     await enqueue_job(job_id, request.model_dump())
 
-    base_url = "https://your-hf-space.hf.space"
+    base_url = "https://novoo5-cadd-backend.hf.space"
     return JobSubmitResponse(
         job_id=job_id,
         message="Job queued from file upload successfully.",
