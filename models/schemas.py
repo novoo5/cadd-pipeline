@@ -58,6 +58,8 @@ class JobRequest(BaseModel):
     binding_site_coords: Optional[BindingSiteCoords] = None
     binding_site_residues: Optional[BindingSiteResidues] = None
     docking_speed: DockingSpeed = DockingSpeed.balanced
+    mw_min: float = Field(200.0, description="Minimum molecular weight for drug-likeness filter (Da)")
+    mw_max: float = Field(500.0, description="Maximum molecular weight for drug-likeness filter (Da)")
 
     @field_validator("smiles")
     @classmethod

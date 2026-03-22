@@ -6,7 +6,6 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-
 from backend.models.schemas import JobRequest, JobSubmitResponse
 from backend.routers import jobs, health
 from backend.worker import enqueue_job
@@ -71,8 +70,8 @@ async def root():
 async def submit_job(request: JobRequest):
     """
     Submit a new pipeline job via JSON body.
-    Pass "direct_score_only": true to skip analogue generation and score
-    the input SMILES directly through the full pipeline as a single compound.
+    Pass "direct_score_only": true to skip analogue generation.
+    Pass "mw_min" and "mw_max" to override the MW filter range (default 200–500 Da).
     """
     job_id = str(uuid.uuid4())
 
@@ -98,13 +97,16 @@ async def submit_job_with_file(
     num_analogues: int = Form(25),
     docking_speed: str = Form("balanced"),
     binding_site_mode: str = Form("auto"),
-    direct_score_only: bool = Form(False),   # ← NEW
+    direct_score_only: bool = Form(False),
+    mw_min: float = Form(200.0),
+    mw_max: float = Form(500.0),
     pdb_id: str = Form(None),
     pdb_file: UploadFile = File(None),
 ):
     """
     Alternative submission for .pdb file uploads (multipart/form-data).
     Set direct_score_only=true to bypass analogue generation.
+    Set mw_min/mw_max to override MW filter range.
     """
     if pdb_id is None and pdb_file is None:
         raise HTTPException(
@@ -133,11 +135,13 @@ async def submit_job_with_file(
         smiles=smiles,
         pdb_id=pdb_id,
         pdb_content=pdb_content,
-        num_analogues=0 if direct_score_only else num_analogues,  # ← CHANGED
-        direct_score_only=direct_score_only,                       # ← NEW
+        num_analogues=0 if direct_score_only else num_analogues,
+        direct_score_only=direct_score_only,
         pipeline_steps=PipelineSteps(),
         binding_site_mode=BindingSiteMode(binding_site_mode),
         docking_speed=DockingSpeed(docking_speed),
+        mw_min=mw_min,
+        mw_max=mw_max,
     )
 
     job_id = str(uuid.uuid4())

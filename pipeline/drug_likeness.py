@@ -1,16 +1,16 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from rdkit import Chem
 from rdkit.Chem import Descriptors, rdMolDescriptors
 from backend.models.schemas import LipinskiResult
 from backend.utils.smiles_validator import smiles_to_mol
 
 
-# ── Lipinski Rule of 5 hard limits ──────────────────────────────────────────
-LIPINSKI_MW_MAX       = 350.0   # ✅ tightened from 500 — kills biphenyls/terphenyls
-LIPINSKI_LOGP_MAX     = 4.5     # ✅ tightened from 5.0 — kills very greasy compounds
-LIPINSKI_HBD_MAX      = 5
-LIPINSKI_HBA_MAX      = 10
-
+# Lipinski defaults (overridable via mw_min/mw_max params)
+DEFAULT_MW_MIN         = 200.0
+DEFAULT_MW_MAX         = 500.0
+LIPINSKI_LOGP_MAX      = 4.5
+LIPINSKI_HBD_MAX       = 5
+LIPINSKI_HBA_MAX       = 10
 LIPINSKI_MAX_VIOLATIONS = 1
 
 # ESOL solubility thresholds (LogS, mol/L)
@@ -19,7 +19,11 @@ SOLUBILITY_MEDIUM = -2.0
 SOLUBILITY_LOW    = -4.0
 
 
-def check_drug_likeness(smiles: str) -> LipinskiResult:
+def check_drug_likeness(
+    smiles: str,
+    mw_min: float = DEFAULT_MW_MIN,
+    mw_max: float = DEFAULT_MW_MAX,
+) -> LipinskiResult:
     mol = smiles_to_mol(smiles)
 
     mw        = Descriptors.MolWt(mol)
@@ -30,7 +34,8 @@ def check_drug_likeness(smiles: str) -> LipinskiResult:
     sol_class = _solubility_class(logs)
 
     violations = sum([
-        mw   > LIPINSKI_MW_MAX,
+        mw   < mw_min,
+        mw   > mw_max,
         logp > LIPINSKI_LOGP_MAX,
         hbd  > LIPINSKI_HBD_MAX,
         hba  > LIPINSKI_HBA_MAX,
@@ -48,17 +53,21 @@ def check_drug_likeness(smiles: str) -> LipinskiResult:
     )
 
 
-def filter_by_drug_likeness(smiles_list: List[str]) -> Tuple[List[str], List[LipinskiResult]]:
+def filter_by_drug_likeness(
+    smiles_list: List[str],
+    mw_min: float = DEFAULT_MW_MIN,
+    mw_max: float = DEFAULT_MW_MAX,
+) -> Tuple[List[str], List[LipinskiResult]]:
     passed_smiles: List[str] = []
     all_results: List[LipinskiResult] = []
 
     for smi in smiles_list:
         try:
-            result = check_drug_likeness(smi)
+            result = check_drug_likeness(smi, mw_min=mw_min, mw_max=mw_max)
             all_results.append(result)
             if result.passed:
                 passed_smiles.append(smi)
-        except Exception as e:
+        except Exception:
             all_results.append(LipinskiResult(
                 passed=False,
                 mw=0.0, logp=0.0, hbd=0, hba=0,
