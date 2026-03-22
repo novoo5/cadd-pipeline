@@ -14,9 +14,9 @@ class PipelineSteps(BaseModel):
 
 
 class BindingSiteMode(str, Enum):
-    auto = "auto"
+    auto        = "auto"
     coordinates = "coordinates"
-    residues = "residues"
+    residues    = "residues"
 
 
 class BindingSiteCoords(BaseModel):
@@ -60,6 +60,13 @@ class JobRequest(BaseModel):
     docking_speed: DockingSpeed = DockingSpeed.balanced
     mw_min: float = Field(200.0, description="Minimum molecular weight for drug-likeness filter (Da)")
     mw_max: float = Field(500.0, description="Maximum molecular weight for drug-likeness filter (Da)")
+    # None = "Ignore completely" — all compounds pass regardless of violation count
+    max_lipinski_violations: Optional[int] = Field(
+        1,
+        description="Max Lipinski violations allowed (1–3). None = ignore filter entirely.",
+        ge=1,
+        le=3,
+    )
 
     @field_validator("smiles")
     @classmethod

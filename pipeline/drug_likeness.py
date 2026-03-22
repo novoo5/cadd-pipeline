@@ -5,13 +5,13 @@ from backend.models.schemas import LipinskiResult
 from backend.utils.smiles_validator import smiles_to_mol
 
 
-# Lipinski defaults (overridable via mw_min/mw_max params)
-DEFAULT_MW_MIN         = 200.0
-DEFAULT_MW_MAX         = 500.0
-LIPINSKI_LOGP_MAX      = 4.5
-LIPINSKI_HBD_MAX       = 5
-LIPINSKI_HBA_MAX       = 10
-LIPINSKI_MAX_VIOLATIONS = 1
+# Lipinski defaults (overridable via request params)
+DEFAULT_MW_MIN              = 200.0
+DEFAULT_MW_MAX              = 500.0
+LIPINSKI_LOGP_MAX           = 4.5
+LIPINSKI_HBD_MAX            = 5
+LIPINSKI_HBA_MAX            = 10
+DEFAULT_MAX_VIOLATIONS      = 1   # classic strict Lipinski
 
 # ESOL solubility thresholds (LogS, mol/L)
 SOLUBILITY_HIGH   =  0.0
@@ -23,7 +23,13 @@ def check_drug_likeness(
     smiles: str,
     mw_min: float = DEFAULT_MW_MIN,
     mw_max: float = DEFAULT_MW_MAX,
+    max_violations: Optional[int] = DEFAULT_MAX_VIOLATIONS,
 ) -> LipinskiResult:
+    """
+    Evaluates Lipinski RO5 + ESOL for a single SMILES.
+    max_violations=None → "Ignore completely": passed is always True,
+    violation counting still runs so the values are stored for display.
+    """
     mol = smiles_to_mol(smiles)
 
     mw        = Descriptors.MolWt(mol)
@@ -40,7 +46,12 @@ def check_drug_likeness(
         hbd  > LIPINSKI_HBD_MAX,
         hba  > LIPINSKI_HBA_MAX,
     ])
-    passed = violations <= LIPINSKI_MAX_VIOLATIONS
+
+    # None = "Ignore completely" → always pass through
+    if max_violations is None:
+        passed = True
+    else:
+        passed = violations <= max_violations
 
     return LipinskiResult(
         passed=passed,
@@ -57,13 +68,23 @@ def filter_by_drug_likeness(
     smiles_list: List[str],
     mw_min: float = DEFAULT_MW_MIN,
     mw_max: float = DEFAULT_MW_MAX,
+    max_violations: Optional[int] = DEFAULT_MAX_VIOLATIONS,
 ) -> Tuple[List[str], List[LipinskiResult]]:
+    """
+    Filters a list of SMILES by drug-likeness.
+    max_violations=None → skip filter, all valid compounds pass through.
+    """
     passed_smiles: List[str] = []
     all_results: List[LipinskiResult] = []
 
     for smi in smiles_list:
         try:
-            result = check_drug_likeness(smi, mw_min=mw_min, mw_max=mw_max)
+            result = check_drug_likeness(
+                smi,
+                mw_min=mw_min,
+                mw_max=mw_max,
+                max_violations=max_violations,
+            )
             all_results.append(result)
             if result.passed:
                 passed_smiles.append(smi)

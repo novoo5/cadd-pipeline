@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -20,17 +21,10 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 # ── Helper: write queued status.json before ARQ picks it up ──────────────────
 
 def _write_initial_status(job_id: str, request: JobRequest):
-    """
-    Writes status.json immediately at submission time so /status never 404s
-    while the job is sitting in the ARQ queue waiting for a worker slot.
-    Without this, jobs returning 404 when queue has 3+ jobs ahead.
-    """
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc).isoformat()
-
-    # Build the step list — mark skipped steps based on pipeline_steps config
     ps = request.pipeline_steps
     steps = [
         {"name": "Drug-likeness Filter", "status": "waiting"},
@@ -112,17 +106,10 @@ async def root():
 async def submit_job(request: JobRequest):
     """
     Submit a new pipeline job via JSON body.
-    Pass "direct_score_only": true to skip analogue generation.
-    Pass "mw_min" and "mw_max" to override the MW filter range (default 200–500 Da).
+    max_lipinski_violations: 1 (strict), 2, 3, or null (ignore filter entirely).
     """
     job_id = str(uuid.uuid4())
-
-    # ✅ Write status.json BEFORE enqueuing — fixes 404 race condition
-    # Previously: only request.json was written here, status.json was created
-    # by the orchestrator only after the worker picked it up. With a full queue
-    # (3+ jobs ahead), the frontend would hit /status, get 404, and give up.
     _write_initial_status(job_id, request)
-
     await enqueue_job(job_id, request.model_dump())
 
     base_url = "https://novoo5-cadd-backend.hf.space"
@@ -144,13 +131,14 @@ async def submit_job_with_file(
     direct_score_only: bool = Form(False),
     mw_min: float = Form(200.0),
     mw_max: float = Form(500.0),
+    # ← NEW: None means "Ignore completely" — sent as -1 from frontend, converted below
+    max_lipinski_violations: Optional[int] = Form(1),
     pdb_id: str = Form(None),
     pdb_file: UploadFile = File(None),
 ):
     """
     Alternative submission for .pdb file uploads (multipart/form-data).
-    Set direct_score_only=true to bypass analogue generation.
-    Set mw_min/mw_max to override MW filter range.
+    max_lipinski_violations: 1 (strict), 2, 3, or -1 → converted to None (ignore).
     """
     if pdb_id is None and pdb_file is None:
         raise HTTPException(
@@ -175,6 +163,9 @@ async def submit_job_with_file(
 
     from backend.models.schemas import PipelineSteps, BindingSiteMode, DockingSpeed
 
+    # Frontend sends -1 to represent "Ignore completely" (None can't go over FormData)
+    resolved_violations = None if max_lipinski_violations == -1 else max_lipinski_violations
+
     request = JobRequest(
         smiles=smiles,
         pdb_id=pdb_id,
@@ -186,13 +177,11 @@ async def submit_job_with_file(
         docking_speed=DockingSpeed(docking_speed),
         mw_min=mw_min,
         mw_max=mw_max,
+        max_lipinski_violations=resolved_violations,
     )
 
     job_id = str(uuid.uuid4())
-
-    # ✅ Write status.json BEFORE enqueuing — same fix as JSON endpoint
     _write_initial_status(job_id, request)
-
     await enqueue_job(job_id, request.model_dump())
 
     base_url = "https://novoo5-cadd-backend.hf.space"

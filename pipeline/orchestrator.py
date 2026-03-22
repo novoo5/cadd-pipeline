@@ -110,10 +110,26 @@ class PipelineOrchestrator:
             t = time.time()
             self._step_start(1)
             if req.pipeline_steps.drug_likeness:
-                passed_lipinski, lipinski_results = filter_by_drug_likeness(analogues)
+                passed_lipinski, lipinski_results = filter_by_drug_likeness(
+                    analogues,
+                    mw_min=req.mw_min,
+                    mw_max=req.mw_max,
+                    max_violations=req.max_lipinski_violations,  # ← NEW
+                )
                 for smi, result in zip(analogues, lipinski_results):
                     compound_results[smi].lipinski = result
-                self._step_done(1, f"{len(passed_lipinski)}/{len(analogues)} passed Lipinski + ESOL", time.time() - t)
+
+                # Build human-readable step message showing the active mode
+                if req.max_lipinski_violations is None:
+                    filter_label = "Lipinski filter ignored (all compounds pass)"
+                else:
+                    filter_label = f"≤{req.max_lipinski_violations} violation(s) allowed"
+
+                self._step_done(
+                    1,
+                    f"{len(passed_lipinski)}/{len(analogues)} passed Lipinski + ESOL ({filter_label})",
+                    time.time() - t,
+                )
                 surviving = passed_lipinski
             else:
                 self._step_skip(1)
@@ -185,7 +201,7 @@ class PipelineOrchestrator:
                     compound_results[smi].docking = result
                 self._step_done(
                     5,
-                    f"{len(passed_docking)}/{len(surviving)} passed docking (affinity ≤ {-5.0} kcal/mol)",
+                    f"{len(passed_docking)}/{len(surviving)} passed docking (affinity ≤ -5.0 kcal/mol)",
                     time.time() - t,
                 )
                 surviving = passed_docking if passed_docking else surviving[:3]
