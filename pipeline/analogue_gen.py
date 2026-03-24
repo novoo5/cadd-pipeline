@@ -1,228 +1,438 @@
+"""
+Exhaustive analogue generator supporting up to 1000 compounds.
+
+Strategy stack (applied in order, then looped with 2nd-order mutations):
+  1. BRICS fragmentation + recombination  (chemically valid, diverse)
+  2. Functional group swaps               (bioisostere replacements)
+  3. Substituent additions                (halogen scan, OH, CN, CF3, OMe, NH2)
+  4. Direct atom mutations                (C/N/O/S swaps, aza-scan on rings)
+  5. Side-chain edits                     (methyl add/remove, chain extend/shorten)
+
+Solubility filter (Delaney ESOL) is applied at generation time when requested.
+modes: "soluble_only" (logS > -3) | "allow_slightly" (logS > -5) | "all" (no filter)
+"""
+
 import random
-from typing import List, Set
+from typing import List, Set, Optional
 from rdkit import Chem
-from rdkit.Chem import BRICS, AllChem, Descriptors
+from rdkit.Chem import BRICS, AllChem, Descriptors, rdMolDescriptors
+from rdkit.Chem.rdchem import RWMol, BondType
 from backend.utils.smiles_validator import smiles_to_mol, mol_to_smiles
 
 
-def generate_analogues(base_smiles: str, num_analogues: int) -> List[str]:
+# ── Solubility (Delaney ESOL) ─────────────────────────────────────────────────
+
+def esol_logS(mol) -> float:
     """
-    Generates structurally diverse analogues of the base compound using three strategies:
-      1. BRICS fragmentation + recombination (primary — most chemically valid)
-      2. Single-atom mutations (swap common functional groups)
-      3. Ring-aware substituent addition
-
-    Returns a deduplicated list of canonical SMILES strings (excluding the base compound).
-    Always attempts to return exactly num_analogues, but may return fewer if
-    chemical space around the scaffold is limited.
+    Delaney ESOL model:
+      logS = 0.16 − 0.63·cLogP − 0.0062·MW + 0.066·nHBA − 0.74·nRB
+    More negative = less soluble.
     """
-    base_mol = smiles_to_mol(base_smiles)
-    base_canonical = mol_to_smiles(base_mol)
-
-    collected: Set[str] = set()
-    collected.add(base_canonical)  # exclude base from results
-
-    # --- Strategy 1: BRICS fragmentation + recombination ---
-    brics_results = _brics_recombination(base_mol, num_analogues * 2)
-    for smi in brics_results:
-        if len(collected) >= num_analogues + 1:
-            break
-        collected.add(smi)
-
-    # --- Strategy 2: Functional group mutations ---
-    if len(collected) - 1 < num_analogues:
-        mutation_results = _functional_group_mutations(base_mol, num_analogues)
-        for smi in mutation_results:
-            if len(collected) >= num_analogues + 1:
-                break
-            collected.add(smi)
-
-    # --- Strategy 3: Substituent additions ---
-    if len(collected) - 1 < num_analogues:
-        addition_results = _substituent_additions(base_mol, num_analogues)
-        for smi in addition_results:
-            if len(collected) >= num_analogues + 1:
-                break
-            collected.add(smi)
-
-    # Remove base compound from results before returning
-    collected.discard(base_canonical)
-    return list(collected)[:num_analogues]
+    try:
+        logP = Descriptors.MolLogP(mol)
+        mw   = Descriptors.MolWt(mol)
+        hba  = rdMolDescriptors.CalcNumHBA(mol)
+        rb   = rdMolDescriptors.CalcNumRotatableBonds(mol)
+        return 0.16 - 0.63 * logP - 0.0062 * mw + 0.066 * hba - 0.74 * rb
+    except Exception:
+        return -99.0
 
 
-def _brics_recombination(mol, target_count: int) -> List[str]:
+def solubility_class(logs: float) -> str:
+    if logs > -1:  return "highly_soluble"
+    if logs > -3:  return "soluble"
+    if logs > -5:  return "slightly_soluble"
+    return "insoluble"
+
+
+_SOLUBILITY_THRESHOLDS = {
+    "soluble_only":   -3.0,
+    "allow_slightly": -5.0,
+    "all":            -99.0,
+}
+
+
+# ── Validity gate ─────────────────────────────────────────────────────────────
+
+def _is_valid(
+    mol,
+    base_canonical:   str,
+    seen:             Set[str],
+    logs_threshold:   float,
+    min_mw:           float,
+    max_mw:           float,
+) -> Optional[str]:
     """
-    Breaks the molecule at BRICS bonds, then recombines fragments randomly.
-    BRICS ensures breaks happen at chemically meaningful bond types.
+    Sanitise, canonicalise, then run MW + solubility checks.
+    Returns canonical SMILES if valid and not yet seen, else None.
     """
+    if mol is None:
+        return None
+    try:
+        Chem.SanitizeMol(mol)
+        smi = Chem.MolToSmiles(mol)
+        if not smi or smi in seen or smi == base_canonical:
+            return None
+        mw = Descriptors.MolWt(mol)
+        if not (min_mw <= mw <= max_mw):
+            return None
+        na = mol.GetNumAtoms()
+        if na < 5 or na > 200:
+            return None
+        if logs_threshold > -90.0 and esol_logS(mol) < logs_threshold:
+            return None
+        return smi
+    except Exception:
+        return None
+
+
+# ── Strategy 1: BRICS ─────────────────────────────────────────────────────────
+
+def _brics_batch(mol, target: int, base_canonical: str, seen: Set[str],
+                 logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
     results = []
     try:
         fragments = list(BRICS.BRICSDecompose(mol))
         if len(fragments) < 2:
             return results
-
-        # Build fragment mols, skip invalid ones
-        frag_mols = []
-        for f in fragments:
-            m = Chem.MolFromSmiles(f)
-            if m is not None:
-                frag_mols.append(m)
-
+        frag_mols = [Chem.MolFromSmiles(f) for f in fragments]
+        frag_mols = [m for m in frag_mols if m is not None]
         if len(frag_mols) < 2:
             return results
 
-        # Generate recombined molecules
-        attempts = 0
-        max_attempts = target_count * 10
-        while len(results) < target_count and attempts < max_attempts:
-            attempts += 1
+        max_attempts = target * 15
+        for _ in range(max_attempts):
+            if len(results) >= target:
+                break
             try:
-                # Randomly pick 2 fragments and recombine
-                chosen = random.sample(frag_mols, min(2, len(frag_mols)))
+                chosen   = random.sample(frag_mols, min(2, len(frag_mols)))
                 new_mols = list(BRICS.BRICSBuild(chosen))
                 for new_mol in new_mols:
-                    if new_mol is None:
-                        continue
-                    smi = mol_to_smiles(new_mol)
-                    if _is_valid_analogue(new_mol):
+                    smi = _is_valid(new_mol, base_canonical, seen, logs_threshold, min_mw, max_mw)
+                    if smi:
+                        seen.add(smi)
                         results.append(smi)
-                    if len(results) >= target_count:
-                        break
+                        if len(results) >= target:
+                            break
             except Exception:
                 continue
-
     except Exception:
         pass
-
     return results
 
 
-# Functional group swap pairs: (SMARTS_to_find, replacement_SMILES_fragment)
+# ── Strategy 2: Functional group swaps ───────────────────────────────────────
+
 _FG_MUTATIONS = [
-    ("[OH]",       "OC"),          # hydroxyl → methoxy
-    ("[OH]",       "N"),           # hydroxyl → amine
-    ("[OH]",       "F"),           # hydroxyl → fluorine (bioisostere)
-    ("[NH2]",      "O"),           # amine → hydroxyl
-    ("[NH2]",      "NC"),          # amine → methylamine
-    ("[F]",        "Cl"),          # F → Cl
-    ("[F]",        "Br"),          # F → Br
-    ("[Cl]",       "F"),           # Cl → F
-    ("[CH3]",      "CC"),          # methyl → ethyl
-    ("[CH3]",      "CF"),          # methyl → fluoromethyl
-    ("C(=O)O",     "C(=O)N"),      # ester → amide
-    ("C(=O)N",     "C(=O)O"),      # amide → ester
+    ("[OH]",   "OC"),     ("[OH]",  "N"),      ("[OH]",  "F"),
+    ("[NH2]",  "O"),      ("[NH2]", "NC"),      ("[NH2]", "NCC"),
+    ("[F]",    "Cl"),     ("[F]",   "Br"),      ("[F]",   "C(F)(F)F"),
+    ("[Cl]",   "F"),      ("[Cl]",  "Br"),
+    ("[Br]",   "F"),      ("[Br]",  "Cl"),
+    ("[CH3]",  "CC"),     ("[CH3]", "CCC"),     ("[CH3]", "CF"),
+    ("[CH3]",  "C(F)(F)F"),
+    ("C(=O)O", "C(=O)N"), ("C(=O)N", "C(=O)O"),
+    ("c[OH]",  "cOC"),    ("c[OH]",  "cN"),
 ]
 
 
-def _functional_group_mutations(mol, target_count: int) -> List[str]:
-    """
-    Applies pairwise functional group swaps using SMARTS patterns.
-    Each successful swap produces one new analogue.
-    """
+def _fg_mutation_batch(mol, target: int, base_canonical: str, seen: Set[str],
+                       logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
     results = []
-    base_smi = mol_to_smiles(mol)
-
-    for smarts, replacement in _FG_MUTATIONS:
-        if len(results) >= target_count:
+    # Shuffle so repeated calls with same mol get different products first
+    mutations = random.sample(_FG_MUTATIONS, len(_FG_MUTATIONS))
+    for smarts, replacement in mutations:
+        if len(results) >= target:
             break
         try:
-            pattern = Chem.MolFromSmarts(smarts)
+            pattern  = Chem.MolFromSmarts(smarts)
             repl_mol = Chem.MolFromSmiles(replacement)
             if pattern is None or repl_mol is None:
                 continue
-
-            # AllChem.ReplaceSubstructs returns a tuple of product mols
             products = AllChem.ReplaceSubstructs(mol, pattern, repl_mol)
             for product in products:
-                if product is None:
-                    continue
-                try:
-                    smi = mol_to_smiles(product)
-                    if smi != base_smi and _is_valid_analogue(product):
-                        results.append(smi)
-                except Exception:
-                    continue
-
+                smi = _is_valid(product, base_canonical, seen, logs_threshold, min_mw, max_mw)
+                if smi:
+                    seen.add(smi)
+                    results.append(smi)
         except Exception:
             continue
-
     return results
 
 
-# Substituents to try adding at open positions
+# ── Strategy 3: Substituent additions ────────────────────────────────────────
+
 _SUBSTITUENTS = [
     "F", "Cl", "Br",
     "C", "CC", "CCC",
-    "OC", "OCC",
+    "OC", "OCC", "OCCC",
     "N", "NC", "NCC",
-    "C(F)(F)F",      # trifluoromethyl
-    "C#N",           # nitrile
-    "S(=O)(=O)N",    # sulfonamide
-    "C(=O)N",        # amide
+    "C(F)(F)F",
+    "C#N",
+    "S(=O)(=O)N",
+    "C(=O)N",
+    "C(=O)O",
+    "OC(F)(F)F",
+    "SC",
 ]
 
 
-def _substituent_additions(mol, target_count: int) -> List[str]:
-    """
-    Attempts to add substituents to aromatic carbons with open hydrogen positions.
-    Uses atom mapping to find substitutable positions.
-    """
+def _substituent_batch(mol, target: int, base_canonical: str, seen: Set[str],
+                       logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
     results = []
-    base_smi = mol_to_smiles(mol)
-
-    rw_mol = Chem.RWMol(mol)
-    aromatic_c_with_h = [
-        atom.GetIdx()
-        for atom in rw_mol.GetAtoms()
-        if atom.GetAtomicNum() == 6
-        and atom.GetIsAromatic()
-        and atom.GetTotalNumHs() > 0
-    ]
-
-    for idx in aromatic_c_with_h:
-        if len(results) >= target_count:
+    pattern = Chem.MolFromSmarts("[cH]")
+    if pattern is None:
+        return results
+    subs = random.sample(_SUBSTITUENTS, len(_SUBSTITUENTS))
+    for sub_smi in subs:
+        if len(results) >= target:
             break
-        for sub_smi in _SUBSTITUENTS:
-            if len(results) >= target_count:
-                break
-            try:
-                sub_mol = Chem.MolFromSmiles(sub_smi)
-                if sub_mol is None:
-                    continue
-                pattern = Chem.MolFromSmarts("[cH]")
-                if pattern is None:
-                    continue
-                products = AllChem.ReplaceSubstructs(mol, pattern, sub_mol, replaceAll=False)
-                for product in products:
-                    if product is None:
-                        continue
-                    try:
-                        smi = mol_to_smiles(product)
-                        if smi != base_smi and _is_valid_analogue(product):
-                            results.append(smi)
-                    except Exception:
-                        continue
-            except Exception:
+        try:
+            sub_mol = Chem.MolFromSmiles(sub_smi)
+            if sub_mol is None:
                 continue
+            products = AllChem.ReplaceSubstructs(mol, pattern, sub_mol, replaceAll=False)
+            for product in products:
+                smi = _is_valid(product, base_canonical, seen, logs_threshold, min_mw, max_mw)
+                if smi:
+                    seen.add(smi)
+                    results.append(smi)
+                    if len(results) >= target:
+                        break
+        except Exception:
+            continue
+    return results
+
+
+# ── Strategy 4: Direct atom mutations (RWMol) ─────────────────────────────────
+
+_ATOM_SUBS = {
+    "C": ["N", "O", "S"],
+    "N": ["C", "O"],
+    "O": ["N", "S"],
+    "S": ["O", "N"],
+}
+_PERIODIC = Chem.GetPeriodicTable()
+
+
+def _rwmol_mutations_batch(mol, target: int, base_canonical: str, seen: Set[str],
+                           logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+    results = []
+    atoms = list(mol.GetAtoms())
+
+    def _try_rw(func):
+        rw = RWMol(mol)
+        try:
+            func(rw)
+            Chem.SanitizeMol(rw)
+            smi = _is_valid(rw.GetMol(), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            if smi:
+                seen.add(smi)
+                results.append(smi)
+        except Exception:
+            pass
+
+    random.shuffle(atoms)
+    for atom in atoms:
+        if len(results) >= target:
+            break
+        sym = atom.GetSymbol()
+        idx = atom.GetIdx()
+
+        # Atom substitution (non-ring)
+        if sym in _ATOM_SUBS and not atom.IsInRing():
+            rep = random.choice(_ATOM_SUBS[sym])
+            def _sub(rw, _idx=idx, _rep=rep):
+                rw.GetAtomWithIdx(_idx).SetAtomicNum(_PERIODIC.GetAtomicNumber(_rep))
+            _try_rw(_sub)
+
+        # Aza-scan (aromatic C → N)
+        if sym == "C" and atom.GetIsAromatic() and atom.IsInRing():
+            def _aza(rw, _idx=idx):
+                rw.GetAtomWithIdx(_idx).SetAtomicNum(7)
+            _try_rw(_aza)
+
+        # Halogen swap
+        if sym in ("F", "Cl", "Br"):
+            hals = [x for x in ("F", "Cl", "Br") if x != sym]
+            rep  = random.choice(hals)
+            def _hal(rw, _idx=idx, _rep=rep):
+                rw.GetAtomWithIdx(_idx).SetAtomicNum(_PERIODIC.GetAtomicNumber(_rep))
+            _try_rw(_hal)
+
+        # Halogen add to aromatic C-H
+        if sym == "C" and atom.GetIsAromatic() and atom.GetTotalNumHs() > 0:
+            hal = random.choice(["F", "Cl", "Br"])
+            def _hadd(rw, _idx=idx, _hal=hal):
+                new = rw.AddAtom(Chem.Atom(_hal))
+                rw.AddBond(_idx, new, BondType.SINGLE)
+            _try_rw(_hadd)
 
     return results
 
 
-def _is_valid_analogue(mol) -> bool:
+# ── Strategy 5: Side-chain edits ──────────────────────────────────────────────
+
+def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
+                       logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+    results = []
+    atoms = list(mol.GetAtoms())
+    random.shuffle(atoms)
+
+    def _try_rw(func):
+        rw = RWMol(mol)
+        try:
+            func(rw)
+            Chem.SanitizeMol(rw)
+            smi = _is_valid(rw.GetMol(), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            if smi:
+                seen.add(smi)
+                results.append(smi)
+        except Exception:
+            pass
+
+    for atom in atoms:
+        if len(results) >= target:
+            break
+        sym = atom.GetSymbol()
+        idx = atom.GetIdx()
+
+        # Methyl add
+        if sym in ("C", "N") and not atom.GetIsAromatic() and atom.GetTotalNumHs() > 0:
+            def _madd(rw, _idx=idx):
+                c = rw.AddAtom(Chem.Atom("C"))
+                rw.AddBond(_idx, c, BondType.SINGLE)
+            _try_rw(_madd)
+
+        # Methyl remove (terminal CH3)
+        if sym == "C" and atom.GetDegree() == 1 and atom.GetTotalNumHs() == 3:
+            def _mrem(rw, _idx=idx):
+                rw.RemoveAtom(_idx)
+            _try_rw(_mrem)
+
+        # Chain extend
+        if sym == "C" and not atom.GetIsAromatic() and atom.GetDegree() <= 3 and atom.GetTotalNumHs() > 0:
+            def _cext(rw, _idx=idx):
+                c = rw.AddAtom(Chem.Atom("C"))
+                rw.AddBond(_idx, c, BondType.SINGLE)
+            _try_rw(_cext)
+
+        # Chain shorten (terminal non-aromatic C with ≥2 Hs)
+        if sym == "C" and not atom.GetIsAromatic() and atom.GetDegree() == 1 and atom.GetTotalNumHs() >= 2:
+            def _csh(rw, _idx=idx):
+                rw.RemoveAtom(_idx)
+            _try_rw(_csh)
+
+        # OH add to aromatic C-H
+        if sym == "C" and atom.GetIsAromatic() and atom.GetTotalNumHs() > 0:
+            def _ohadd(rw, _idx=idx):
+                o = rw.AddAtom(Chem.Atom("O"))
+                rw.AddBond(_idx, o, BondType.SINGLE)
+            _try_rw(_ohadd)
+
+    return results
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def generate_analogues(
+    base_smiles:              str,
+    num_analogues:            int,
+    filter_solubility:        str   = "all",
+    min_mw:                   float = 100.0,
+    max_mw:                   float = 800.0,
+    max_attempts_multiplier:  int   = 40,
+) -> List[str]:
     """
-    Fast sanity check before accepting an analogue.
-    Rejects molecules that are too small, too large, or have impossible valence.
+    Generate up to num_analogues unique analogues of base_smiles.
+
+    Args:
+        base_smiles:             Input SMILES.
+        num_analogues:           Target count (1–1000).
+        filter_solubility:       "soluble_only" | "allow_slightly" | "all"
+        min_mw / max_mw:         MW window for acceptance.
+        max_attempts_multiplier: Total strategy loop budget = n × multiplier.
+
+    Returns:
+        List of canonical SMILES (up to num_analogues, may be fewer if
+        chemical space is genuinely exhausted).
     """
+    base_mol = smiles_to_mol(base_smiles)
+    if base_mol is None:
+        return []
+
+    base_canonical    = mol_to_smiles(base_mol)
+    logs_threshold    = _SOLUBILITY_THRESHOLDS.get(filter_solubility, -99.0)
+    seen: Set[str]    = {base_canonical}
+    results: List[str] = []
+
+    # ── Pass 1: all 5 strategies on the base molecule ─────────────────────────
+    remaining = num_analogues - len(results)
+
+    # 1. BRICS
+    batch = _brics_batch(base_mol, remaining, base_canonical, seen, logs_threshold, min_mw, max_mw)
+    results.extend(batch)
+
+    # 2. FG mutations
+    if len(results) < num_analogues:
+        batch = _fg_mutation_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        results.extend(batch)
+
+    # 3. Substituent additions
+    if len(results) < num_analogues:
+        batch = _substituent_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        results.extend(batch)
+
+    # 4. RWMol atom mutations
+    if len(results) < num_analogues:
+        batch = _rwmol_mutations_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        results.extend(batch)
+
+    # 5. Chain edits
+    if len(results) < num_analogues:
+        batch = _chain_edits_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        results.extend(batch)
+
+    # ── Pass 2+: 2nd-order mutations from accepted analogues ─────────────────
+    # Keeps looping until budget exhausted or target hit.
+    # Each round picks random accepted analogues as new parents.
+    budget = num_analogues * max_attempts_multiplier
+    iters  = 0
+
+    while len(results) < num_analogues and iters < budget:
+        iters += 1
+        if not results:
+            break
+
+        # Pick a random accepted analogue as parent for this iteration
+        parent_smi = random.choice(results)
+        parent_mol = Chem.MolFromSmiles(parent_smi)
+        if parent_mol is None:
+            continue
+
+        strategy = random.randint(1, 5)
+        need     = num_analogues - len(results)
+
+        if strategy == 1:
+            batch = _brics_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        elif strategy == 2:
+            batch = _fg_mutation_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        elif strategy == 3:
+            batch = _substituent_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        elif strategy == 4:
+            batch = _rwmol_mutations_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        else:
+            batch = _chain_edits_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+
+        results.extend(batch)
+
+    return results[:num_analogues]
+
+
+def get_solubility_info(smiles: str) -> dict:
+    """Return ESOL logS and solubility class for a SMILES string."""
+    mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return False
-    try:
-        Chem.SanitizeMol(mol)
-        num_atoms = mol.GetNumAtoms()
-        if num_atoms < 5 or num_atoms > 200:
-            return False
-        mw = Descriptors.MolWt(mol)
-        if mw < 100 or mw > 1500:
-            return False
-        return True
-    except Exception:
-        return False
+        return {"logs": None, "class": "unknown"}
+    logs = esol_logS(mol)
+    return {"logs": round(logs, 3), "class": solubility_class(logs)}
