@@ -2,7 +2,7 @@ import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 from backend.models.schemas import (
     JobRequest, JobStatusResponse, JobResultsResponse,
@@ -11,7 +11,7 @@ from backend.models.schemas import (
 from backend.pipeline.analogue_gen import generate_analogues
 from backend.pipeline.drug_likeness import (
     filter_by_drug_likeness,
-    filter_by_solubility,        # ← NEW import
+    filter_by_solubility,
 )
 from backend.pipeline.admet import run_admet_batch
 from backend.pipeline.binding_prefilter import run_binding_prefilter
@@ -71,6 +71,8 @@ class PipelineOrchestrator:
         self.steps[index].status           = StepStatus.done
         self.steps[index].message          = message
         self.steps[index].duration_seconds = round(elapsed, 2)
+        self.steps[index].progress_current = None  # ← clear bar on completion
+        self.steps[index].progress_total   = None
         self._write_status("running")
 
     def _step_skip(self, index: int, reason: str = "Disabled by user"):
@@ -82,6 +84,12 @@ class PipelineOrchestrator:
         self.steps[index].status  = StepStatus.failed
         self.steps[index].message = error
         self._write_status("failed", error=error)
+
+    # ← NEW: write live progress into a step and flush to disk
+    def _update_step_progress(self, index: int, current: int, total: int):
+        self.steps[index].progress_current = current
+        self.steps[index].progress_total   = total
+        self._write_status("running")
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
@@ -99,6 +107,10 @@ class PipelineOrchestrator:
             t = time.time()
             self._step_start(0)
 
+            # ← progress callback: fires every ~10 compounds found
+            def analogue_progress(current: int, total: int):
+                self._update_step_progress(0, current, total)
+
             if req.toxicity_report_only:
                 if req.num_analogues > 0:
                     analogues = await asyncio.to_thread(
@@ -106,6 +118,7 @@ class PipelineOrchestrator:
                         canonical_smiles,
                         req.num_analogues,
                         req.solubility_filter.value,
+                        on_progress=analogue_progress,
                     )
                     if not analogues:
                         analogues = [canonical_smiles]
@@ -142,6 +155,7 @@ class PipelineOrchestrator:
                     canonical_smiles,
                     req.num_analogues,
                     req.solubility_filter.value,
+                    on_progress=analogue_progress,
                 )
                 if not analogues:
                     raise RuntimeError("Analogue generation produced 0 compounds.")
@@ -178,10 +192,9 @@ class PipelineOrchestrator:
                 for smi, result in zip(analogues, lipinski_results):
                     compound_results[smi].lipinski = result
 
-                # ── NEW: solubility gate applied AFTER Lipinski ───────────────
                 sol_filter = req.solubility_filter.value if req.solubility_filter else "all"
                 if sol_filter != "all":
-                    before_sol = len(passed_lipinski)
+                    before_sol      = len(passed_lipinski)
                     passed_lipinski = filter_by_solubility(
                         passed_lipinski, compound_results, sol_filter
                     )
@@ -189,7 +202,6 @@ class PipelineOrchestrator:
                     sol_label   = f" · {sol_dropped} removed by solubility filter ({sol_filter})"
                 else:
                     sol_label = ""
-                # ─────────────────────────────────────────────────────────────
 
                 if req.max_lipinski_violations is None:
                     filter_label = "Lipinski filter ignored (all compounds pass)"
@@ -320,11 +332,16 @@ class PipelineOrchestrator:
                 t = time.time()
                 self._step_start(5)
                 if req.pipeline_steps.docking:
+                    # ← progress callback: fires after each compound is docked
+                    def docking_progress(current: int, total: int):
+                        self._update_step_progress(5, current, total)
+
                     passed_docking, docking_results, binding_site_info = await asyncio.to_thread(
                         dock_compounds,
                         surviving, receptor_pdbqt, self.job_id, raw_pdb_path,
                         req.binding_site_mode, req.docking_speed,
                         req.binding_site_coords, req.binding_site_residues,
+                        on_progress=docking_progress,   # ← NEW
                     )
                     for smi, result in zip(surviving, docking_results):
                         compound_results[smi].docking = result

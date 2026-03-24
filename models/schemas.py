@@ -4,7 +4,9 @@ from enum import Enum
 from datetime import datetime
 
 
+
 # ── Enums ─────────────────────────────────────────────────────────────────────
+
 
 class PipelineSteps(BaseModel):
     drug_likeness:     bool = True
@@ -14,10 +16,12 @@ class PipelineSteps(BaseModel):
     retrosynthesis:    bool = True
 
 
+
 class BindingSiteMode(str, Enum):
     auto        = "auto"
     coordinates = "coordinates"
     residues    = "residues"
+
 
 
 class DockingSpeed(str, Enum):
@@ -26,13 +30,16 @@ class DockingSpeed(str, Enum):
     thorough = "thorough"
 
 
+
 class SolubilityFilterMode(str, Enum):
     soluble_only   = "soluble_only"
     allow_slightly = "allow_slightly"
     all            = "all"
 
 
+
 # ── Sub-models ────────────────────────────────────────────────────────────────
+
 
 class BindingSiteCoords(BaseModel):
     x:        float
@@ -41,10 +48,12 @@ class BindingSiteCoords(BaseModel):
     box_size: float = 20.0
 
 
+
 class BindingSiteResidues(BaseModel):
     chain:         str
     residue_start: int
     residue_end:   int
+
 
 
 class BindingSiteInfo(BaseModel):
@@ -56,7 +65,9 @@ class BindingSiteInfo(BaseModel):
     box_size:             float
 
 
+
 # ── Job request ───────────────────────────────────────────────────────────────
+
 
 class JobRequest(BaseModel):
     smiles:      str           = Field(..., description="SMILES string of the base compound")
@@ -141,7 +152,9 @@ class JobRequest(BaseModel):
         return self
 
 
+
 # ── Status / steps ────────────────────────────────────────────────────────────
+
 
 class StepStatus(str, Enum):
     waiting = "waiting"
@@ -151,11 +164,15 @@ class StepStatus(str, Enum):
     failed  = "failed"
 
 
+
 class PipelineStepInfo(BaseModel):
     name:             str
     status:           StepStatus     = StepStatus.waiting
     message:          Optional[str]  = None
     duration_seconds: Optional[float] = None
+    progress_current: Optional[int]  = None   # ← NEW: e.g. 47
+    progress_total:   Optional[int]  = None   # ← NEW: e.g. 100
+
 
 
 class JobStatusResponse(BaseModel):
@@ -167,7 +184,9 @@ class JobStatusResponse(BaseModel):
     error:      Optional[str]          = None
 
 
+
 # ── Pipeline step results ─────────────────────────────────────────────────────
+
 
 class LipinskiResult(BaseModel):
     passed:           bool
@@ -179,6 +198,7 @@ class LipinskiResult(BaseModel):
     solubility_class: str
 
 
+
 class ADMETFlagDetail(BaseModel):
     property_name:  str
     value:          float
@@ -187,6 +207,7 @@ class ADMETFlagDetail(BaseModel):
     severity:       str
     implication:    str
     recommendation: str
+
 
 
 class ADMETResult(BaseModel):
@@ -200,10 +221,12 @@ class ADMETResult(BaseModel):
     flag_summary: List[str]            = []
 
 
+
 class BindingPrefilterResult(BaseModel):
     passed:                  bool
     predicted_affinity_kcal: float
     confidence:              float
+
 
 
 class DockingPose(BaseModel):
@@ -213,11 +236,13 @@ class DockingPose(BaseModel):
     rmsd_ub:       float
 
 
+
 class DockingResult(BaseModel):
     passed:             bool
     best_affinity_kcal: float
     cnn_score:          float
     poses:              List[DockingPose]
+
 
 
 class RetrosynthesisStep(BaseModel):
@@ -227,11 +252,13 @@ class RetrosynthesisStep(BaseModel):
     confidence:         float
 
 
+
 class RetrosynthesisResult(BaseModel):
     feasible:         bool
     num_steps:        int
     route:            List[RetrosynthesisStep]
     complexity_score: float
+
 
 
 class CompoundResult(BaseModel):
@@ -246,7 +273,9 @@ class CompoundResult(BaseModel):
     retrosynthesis:    Optional[RetrosynthesisResult]   = None
 
 
+
 # ── Job responses ─────────────────────────────────────────────────────────────
+
 
 class JobResultsResponse(BaseModel):
     job_id:                    str
@@ -260,6 +289,7 @@ class JobResultsResponse(BaseModel):
     binding_site_info:         Optional[BindingSiteInfo] = None
     created_at:                datetime
     completed_at:              datetime
+
 
 
 class JobSubmitResponse(BaseModel):

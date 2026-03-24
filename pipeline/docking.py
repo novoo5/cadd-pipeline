@@ -2,7 +2,7 @@ import re
 import subprocess
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable  # ← added Callable
 
 from backend.models.schemas import (
     DockingResult,
@@ -32,17 +32,17 @@ PASS_THRESHOLD = -5.0
 
 
 def dock_compounds(
-    smiles_list: List[str],
-    receptor_pdbqt: str,
-    job_id: str,
-    raw_pdb_path: str,
-    binding_site_mode: BindingSiteMode,
-    docking_speed: DockingSpeed,
-    binding_site_coords: Optional[BindingSiteCoords] = None,
+    smiles_list:           List[str],
+    receptor_pdbqt:        str,
+    job_id:                str,
+    raw_pdb_path:          str,
+    binding_site_mode:     BindingSiteMode,
+    docking_speed:         DockingSpeed,
+    binding_site_coords:   Optional[BindingSiteCoords]   = None,
     binding_site_residues: Optional[BindingSiteResidues] = None,
-) -> Tuple[List[str], List[DockingResult], BindingSiteInfo]:  # ✅ now returns 3-tuple
+    on_progress:           Optional[Callable[[int, int], None]] = None,  # ← NEW
+) -> Tuple[List[str], List[DockingResult], BindingSiteInfo]:
 
-    # ✅ unpack 3-tuple — center, box_size, info
     center, _, binding_site_info = get_binding_site_box(
         pdb_path=raw_pdb_path,
         mode=binding_site_mode,
@@ -52,11 +52,12 @@ def dock_compounds(
     cx, cy, cz = center
     exhaustiveness = EXHAUSTIVENESS_MAP[docking_speed]
 
-    passed_smiles: List[str] = []
-    all_results: List[DockingResult] = []
+    passed_smiles: List[str]       = []
+    all_results:   List[DockingResult] = []
+    total = len(smiles_list)
 
     for idx, smi in enumerate(smiles_list):
-        print(f"[Docking] Compound {idx + 1}/{len(smiles_list)}: {smi[:40]}...")
+        print(f"[Docking] Compound {idx + 1}/{total}: {smi[:40]}...")
         try:
             result = _dock_single(
                 smiles=smi,
@@ -80,18 +81,22 @@ def dock_compounds(
                 poses=[],
             ))
 
+        # ← NEW: fire progress after every compound completes (pass or fail)
+        if on_progress:
+            on_progress(idx + 1, total)
+
     return passed_smiles, all_results, binding_site_info
 
 
 def _dock_single(
-    smiles: str,
-    receptor_pdbqt: str,
-    job_id: str,
-    compound_index: int,
-    cx: float,
-    cy: float,
-    cz: float,
-    exhaustiveness: int,
+    smiles:          str,
+    receptor_pdbqt:  str,
+    job_id:          str,
+    compound_index:  int,
+    cx:              float,
+    cy:              float,
+    cz:              float,
+    exhaustiveness:  int,
 ) -> DockingResult:
 
     ligand_pdbqt = prepare_ligand(smiles, job_id, compound_index)
@@ -155,7 +160,7 @@ def _parse_vina_output(stdout: str) -> List[DockingPose]:
     pattern = re.compile(
         r"^\s*(\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*$"
     )
-    poses = []
+    poses    = []
     in_table = False
 
     for line in stdout.splitlines():

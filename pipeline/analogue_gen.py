@@ -13,7 +13,7 @@ modes: "soluble_only" (logS > -3) | "allow_slightly" (logS > -5) | "all" (no fil
 """
 
 import random
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Callable  # ← added Callable
 from rdkit import Chem
 from rdkit.Chem import BRICS, AllChem, Descriptors, rdMolDescriptors
 from rdkit.Chem.rdchem import RWMol, BondType
@@ -324,10 +324,11 @@ def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
 def generate_analogues(
     base_smiles:             str,
     num_analogues:           int,
-    filter_solubility:       str   = "all",
-    min_mw:                  float = 100.0,
-    max_mw:                  float = 800.0,
-    max_attempts_multiplier: int   = 40,
+    filter_solubility:       str                              = "all",
+    min_mw:                  float                           = 100.0,
+    max_mw:                  float                           = 800.0,
+    max_attempts_multiplier: int                             = 40,
+    on_progress:             Optional[Callable[[int, int], None]] = None,  # ← NEW
 ) -> List[str]:
     """
     Generate up to num_analogues unique analogues of base_smiles.
@@ -338,6 +339,8 @@ def generate_analogues(
         filter_solubility:       "soluble_only" | "allow_slightly" | "all"
         min_mw / max_mw:         MW window for acceptance.
         max_attempts_multiplier: Total strategy loop budget = n × multiplier.
+        on_progress:             Optional callback(current, total) fired every
+                                 10 new compounds — used for real-time UI updates.
 
     Returns:
         List of canonical SMILES (up to num_analogues, may be fewer if
@@ -347,9 +350,9 @@ def generate_analogues(
     if base_mol is None:
         return []
 
-    base_canonical    = mol_to_smiles(base_mol)
-    logs_threshold    = _SOLUBILITY_THRESHOLDS.get(filter_solubility, -99.0)
-    seen: Set[str]    = {base_canonical}
+    base_canonical     = mol_to_smiles(base_mol)
+    logs_threshold     = _SOLUBILITY_THRESHOLDS.get(filter_solubility, -99.0)
+    seen: Set[str]     = {base_canonical}
     results: List[str] = []
 
     # ── Scale multiplier down at high counts to keep runtime sane ────────────
@@ -365,25 +368,40 @@ def generate_analogues(
         max_attempts_multiplier = 30
     # ≤200 keeps the default 40×
 
+    # ── Progress reporter: fires every 10 new compounds ───────────────────────
+    _last_reported = [0]
+
+    def _maybe_report():
+        if on_progress is None:
+            return
+        if len(results) - _last_reported[0] >= 10 or len(results) == num_analogues:
+            on_progress(len(results), num_analogues)
+            _last_reported[0] = len(results)
+
     # ── Pass 1: all 5 strategies on the base molecule ─────────────────────────
     batch = _brics_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
     results.extend(batch)
+    _maybe_report()
 
     if len(results) < num_analogues:
         batch = _fg_mutation_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
+        _maybe_report()
 
     if len(results) < num_analogues:
         batch = _substituent_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
+        _maybe_report()
 
     if len(results) < num_analogues:
         batch = _rwmol_mutations_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
+        _maybe_report()
 
     if len(results) < num_analogues:
         batch = _chain_edits_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
+        _maybe_report()
 
     # ── Pass 2+: 2nd-order mutations from accepted analogues ──────────────────
     budget = num_analogues * max_attempts_multiplier
@@ -414,6 +432,7 @@ def generate_analogues(
             batch = _chain_edits_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
 
         results.extend(batch)
+        _maybe_report()
 
     return results[:num_analogues]
 
