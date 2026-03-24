@@ -9,7 +9,10 @@ from backend.models.schemas import (
     PipelineStepInfo, StepStatus, CompoundResult, BindingSiteInfo,
 )
 from backend.pipeline.analogue_gen import generate_analogues
-from backend.pipeline.drug_likeness import filter_by_drug_likeness
+from backend.pipeline.drug_likeness import (
+    filter_by_drug_likeness,
+    filter_by_solubility,        # ← NEW import
+)
 from backend.pipeline.admet import run_admet_batch
 from backend.pipeline.binding_prefilter import run_binding_prefilter
 from backend.pipeline.protein_prep import prepare_receptor
@@ -97,9 +100,6 @@ class PipelineOrchestrator:
             self._step_start(0)
 
             if req.toxicity_report_only:
-                # Toxicity-only: score input compound as-is, no generation needed
-                # (unless user explicitly set num_analogues > 0 in which case
-                #  we generate so they get a multi-compound toxicity report)
                 if req.num_analogues > 0:
                     analogues = await asyncio.to_thread(
                         generate_analogues,
@@ -109,7 +109,6 @@ class PipelineOrchestrator:
                     )
                     if not analogues:
                         analogues = [canonical_smiles]
-                    # Always include the base compound in the toxicity report
                     if canonical_smiles not in analogues:
                         analogues = [canonical_smiles] + analogues
                     self._step_done(
@@ -142,7 +141,7 @@ class PipelineOrchestrator:
                     generate_analogues,
                     canonical_smiles,
                     req.num_analogues,
-                    req.solubility_filter.value,   # ← solubility filter passed here
+                    req.solubility_filter.value,
                 )
                 if not analogues:
                     raise RuntimeError("Analogue generation produced 0 compounds.")
@@ -166,7 +165,6 @@ class PipelineOrchestrator:
             self._step_start(1)
 
             if req.toxicity_report_only:
-                # No drug-likeness gate in toxicity-only mode — screen everything
                 self._step_skip(1, "Skipped — toxicity report mode screens all compounds")
                 surviving = analogues
 
@@ -180,6 +178,19 @@ class PipelineOrchestrator:
                 for smi, result in zip(analogues, lipinski_results):
                     compound_results[smi].lipinski = result
 
+                # ── NEW: solubility gate applied AFTER Lipinski ───────────────
+                sol_filter = req.solubility_filter.value if req.solubility_filter else "all"
+                if sol_filter != "all":
+                    before_sol = len(passed_lipinski)
+                    passed_lipinski = filter_by_solubility(
+                        passed_lipinski, compound_results, sol_filter
+                    )
+                    sol_dropped = before_sol - len(passed_lipinski)
+                    sol_label   = f" · {sol_dropped} removed by solubility filter ({sol_filter})"
+                else:
+                    sol_label = ""
+                # ─────────────────────────────────────────────────────────────
+
                 if req.max_lipinski_violations is None:
                     filter_label = "Lipinski filter ignored (all compounds pass)"
                 else:
@@ -187,7 +198,7 @@ class PipelineOrchestrator:
 
                 self._step_done(
                     1,
-                    f"{len(passed_lipinski)}/{len(analogues)} passed Lipinski + ESOL ({filter_label})",
+                    f"{len(passed_lipinski)}/{len(analogues)} passed Lipinski + ESOL ({filter_label}){sol_label}",
                     time.time() - t,
                 )
                 surviving = passed_lipinski
@@ -199,13 +210,9 @@ class PipelineOrchestrator:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
 
             # ── STEP 3: ADMET ─────────────────────────────────────────────────
-            # In toxicity_report_only mode this runs alone (no concurrent protein prep).
-            # In normal mode it runs concurrently with protein prep (step 5).
-
             t_pdb = time.time()
 
             if req.toxicity_report_only:
-                # ── Toxicity-only path ────────────────────────────────────────
                 self._step_start(2)
                 t_admet = time.time()
                 passed_admet, admet_results = await asyncio.to_thread(
@@ -214,9 +221,8 @@ class PipelineOrchestrator:
                 for smi, result in zip(surviving, admet_results):
                     compound_results[smi].admet = result
 
-                # Build flag summary for step message
-                total_flags   = sum(len(r.flags) for r in admet_results)
-                high_flags    = sum(
+                total_flags = sum(len(r.flags) for r in admet_results)
+                high_flags  = sum(
                     1 for r in admet_results
                     for f in r.flags if f.severity == "high"
                 )
@@ -229,7 +235,6 @@ class PipelineOrchestrator:
                     time.time() - t_admet,
                 )
 
-                # Skip all remaining structural steps
                 self._step_skip(3, "Skipped — toxicity report mode")
                 self._step_skip(4, "Skipped — no docking in toxicity report mode")
                 self._step_skip(5, "Skipped — toxicity report mode")
@@ -239,7 +244,6 @@ class PipelineOrchestrator:
                 receptor_pdbqt = None
 
             else:
-                # ── Normal path: concurrent ADMET + protein prep ──────────────
                 self._step_start(4)
                 if req.pdb_id:
                     raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
@@ -358,7 +362,6 @@ class PipelineOrchestrator:
             self._write_results(ranked, canonical_smiles, len(analogues), binding_site_info)
             self._write_status("done")
 
-            # Cleanup only if docking actually ran
             if not req.toxicity_report_only and req.pipeline_steps.docking:
                 cleanup_docking_files(self.job_id)
 

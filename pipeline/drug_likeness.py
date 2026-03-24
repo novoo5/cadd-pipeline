@@ -1,22 +1,29 @@
 from typing import List, Tuple, Optional
 from rdkit import Chem
 from rdkit.Chem import Descriptors, rdMolDescriptors
-from backend.models.schemas import LipinskiResult
+from backend.models.schemas import LipinskiResult, CompoundResult
 from backend.utils.smiles_validator import smiles_to_mol
 
 
 # Lipinski defaults (overridable via request params)
-DEFAULT_MW_MIN              = 200.0
-DEFAULT_MW_MAX              = 500.0
-LIPINSKI_LOGP_MAX           = 4.5
-LIPINSKI_HBD_MAX            = 5
-LIPINSKI_HBA_MAX            = 10
-DEFAULT_MAX_VIOLATIONS      = 1   # classic strict Lipinski
+DEFAULT_MW_MIN         = 200.0
+DEFAULT_MW_MAX         = 500.0
+LIPINSKI_LOGP_MAX      = 4.5
+LIPINSKI_HBD_MAX       = 5
+LIPINSKI_HBA_MAX       = 10
+DEFAULT_MAX_VIOLATIONS = 1
 
 # ESOL solubility thresholds (LogS, mol/L)
 SOLUBILITY_HIGH   =  0.0
 SOLUBILITY_MEDIUM = -2.0
 SOLUBILITY_LOW    = -4.0
+
+# ← NEW: which solubility classes are allowed per filter mode
+SOLUBILITY_FILTER_MAP: dict[str, set[str]] = {
+    "soluble_only":   {"High"},
+    "allow_slightly": {"High", "Medium"},
+    "all":            {"High", "Medium", "Low", "Very Low", "Invalid"},
+}
 
 
 def check_drug_likeness(
@@ -47,7 +54,6 @@ def check_drug_likeness(
         hba  > LIPINSKI_HBA_MAX,
     ])
 
-    # None = "Ignore completely" → always pass through
     if max_violations is None:
         passed = True
     else:
@@ -75,7 +81,7 @@ def filter_by_drug_likeness(
     max_violations=None → skip filter, all valid compounds pass through.
     """
     passed_smiles: List[str] = []
-    all_results: List[LipinskiResult] = []
+    all_results:   List[LipinskiResult] = []
 
     for smi in smiles_list:
         try:
@@ -97,6 +103,28 @@ def filter_by_drug_likeness(
             ))
 
     return passed_smiles, all_results
+
+
+# ← NEW ───────────────────────────────────────────────────────────────────────
+def filter_by_solubility(
+    smiles_list:       List[str],
+    compound_results:  dict[str, "CompoundResult"],
+    solubility_filter: str = "all",
+) -> List[str]:
+    """
+    Post-Lipinski solubility gate.
+    Drops any compound whose solubility_class is not in the allowed set.
+    Compounds that never ran Lipinski (no lipinski attr) are always kept.
+    """
+    allowed = SOLUBILITY_FILTER_MAP.get(solubility_filter, SOLUBILITY_FILTER_MAP["all"])
+    return [
+        smi for smi in smiles_list
+        if (
+            smi not in compound_results
+            or compound_results[smi].lipinski is None
+            or compound_results[smi].lipinski.solubility_class in allowed
+        )
+    ]
 
 
 def _calc_esol_logs(mol) -> float:
