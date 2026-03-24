@@ -7,11 +7,11 @@ from datetime import datetime
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class PipelineSteps(BaseModel):
-    drug_likeness:    bool = True
-    admet:            bool = True
+    drug_likeness:     bool = True
+    admet:             bool = True
     binding_prefilter: bool = True
-    docking:          bool = True
-    retrosynthesis:   bool = True
+    docking:           bool = True
+    retrosynthesis:    bool = True
 
 
 class BindingSiteMode(str, Enum):
@@ -27,9 +27,9 @@ class DockingSpeed(str, Enum):
 
 
 class SolubilityFilterMode(str, Enum):
-    soluble_only   = "soluble_only"    # logS > -3 (highly soluble + soluble)
-    allow_slightly = "allow_slightly"  # logS > -5 (also slightly soluble)
-    all            = "all"             # no filter (original behaviour)
+    soluble_only   = "soluble_only"
+    allow_slightly = "allow_slightly"
+    all            = "all"
 
 
 # ── Sub-models ────────────────────────────────────────────────────────────────
@@ -59,19 +59,18 @@ class BindingSiteInfo(BaseModel):
 # ── Job request ───────────────────────────────────────────────────────────────
 
 class JobRequest(BaseModel):
-    smiles:       str           = Field(..., description="SMILES string of the base compound")
-    pdb_id:       Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC)")
-    pdb_content:  Optional[str] = Field(None, description="Raw .pdb file content as string")
+    smiles:      str           = Field(..., description="SMILES string of the base compound")
+    pdb_id:      Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC)")
+    pdb_content: Optional[str] = Field(None, description="Raw .pdb file content as string")
 
-    # ── was Literal[0,10,25,50] — now supports 1–1000 ─────────────────────────
-    num_analogues: int = Field(25, ge=0, le=1000)
+    # ← was le=1000
+    num_analogues: int = Field(25, ge=0, le=10000)
 
     direct_score_only: bool = Field(
         False,
         description="Skip analogue generation; score the input compound directly",
     )
 
-    # ── NEW: solubility filter applied during analogue generation ─────────────
     solubility_filter: SolubilityFilterMode = Field(
         SolubilityFilterMode.all,
         description=(
@@ -80,7 +79,6 @@ class JobRequest(BaseModel):
         ),
     )
 
-    # ── NEW: skip everything except ADMET — no PDB required ──────────────────
     toxicity_report_only: bool = Field(
         False,
         description=(
@@ -90,11 +88,11 @@ class JobRequest(BaseModel):
         ),
     )
 
-    pipeline_steps:        PipelineSteps           = Field(default_factory=PipelineSteps)
-    binding_site_mode:     BindingSiteMode          = BindingSiteMode.auto
+    pipeline_steps:        PipelineSteps                = Field(default_factory=PipelineSteps)
+    binding_site_mode:     BindingSiteMode               = BindingSiteMode.auto
     binding_site_coords:   Optional[BindingSiteCoords]   = None
     binding_site_residues: Optional[BindingSiteResidues] = None
-    docking_speed:         DockingSpeed             = DockingSpeed.balanced
+    docking_speed:         DockingSpeed                  = DockingSpeed.balanced
 
     mw_min: float = Field(200.0, ge=0, description="Min MW for drug-likeness filter (Da)")
     mw_max: float = Field(500.0, ge=0, description="Max MW for drug-likeness filter (Da)")
@@ -125,7 +123,6 @@ class JobRequest(BaseModel):
 
     @model_validator(mode="after")
     def cross_field_checks(self) -> "JobRequest":
-        # PDB only required when docking is actually going to run
         needs_pdb = (
             not self.toxicity_report_only
             and self.pipeline_steps.docking
@@ -156,8 +153,8 @@ class StepStatus(str, Enum):
 
 class PipelineStepInfo(BaseModel):
     name:             str
-    status:           StepStatus    = StepStatus.waiting
-    message:          Optional[str] = None
+    status:           StepStatus     = StepStatus.waiting
+    message:          Optional[str]  = None
     duration_seconds: Optional[float] = None
 
 
@@ -173,25 +170,23 @@ class JobStatusResponse(BaseModel):
 # ── Pipeline step results ─────────────────────────────────────────────────────
 
 class LipinskiResult(BaseModel):
-    passed:          bool
-    mw:              float
-    logp:            float
-    hbd:             int
-    hba:             int
-    logs:            float
+    passed:           bool
+    mw:               float
+    logp:             float
+    hbd:              int
+    hba:              int
+    logs:             float
     solubility_class: str
 
 
-# ── NEW: structured ADMET flag with full context ──────────────────────────────
-
 class ADMETFlagDetail(BaseModel):
-    property_name:  str    # e.g. "hERG Inhibition"
-    value:          float  # e.g. 0.87
-    threshold:      str    # e.g. ">0.50"
-    direction:      str    # "above" | "below"
-    severity:       str    # "high" | "moderate" | "low"
-    implication:    str    # e.g. "cardiac arrhythmia / QT prolongation risk"
-    recommendation: str    # redesign suggestion
+    property_name:  str
+    value:          float
+    threshold:      str
+    direction:      str
+    severity:       str
+    implication:    str
+    recommendation: str
 
 
 class ADMETResult(BaseModel):
@@ -201,9 +196,7 @@ class ADMETResult(BaseModel):
     bbb_penetration:      float
     hepatotoxicity:       float
     oral_bioavailability: float
-    # ← was List[str] — now structured objects for the report
     flags:        List[ADMETFlagDetail] = []
-    # ← plain-English one-liners for the UI badge list
     flag_summary: List[str]            = []
 
 
@@ -214,17 +207,17 @@ class BindingPrefilterResult(BaseModel):
 
 
 class DockingPose(BaseModel):
-    rank:        int
+    rank:          int
     affinity_kcal: float
-    rmsd_lb:     float
-    rmsd_ub:     float
+    rmsd_lb:       float
+    rmsd_ub:       float
 
 
 class DockingResult(BaseModel):
-    passed:            bool
+    passed:             bool
     best_affinity_kcal: float
-    cnn_score:         float
-    poses:             List[DockingPose]
+    cnn_score:          float
+    poses:              List[DockingPose]
 
 
 class RetrosynthesisStep(BaseModel):
@@ -242,15 +235,15 @@ class RetrosynthesisResult(BaseModel):
 
 
 class CompoundResult(BaseModel):
-    smiles:           str
-    canonical_smiles: str
-    rank:             Optional[int]   = None
-    final_score:      Optional[float] = None
-    lipinski:         Optional[LipinskiResult]         = None
-    admet:            Optional[ADMETResult]            = None
+    smiles:            str
+    canonical_smiles:  str
+    rank:              Optional[int]                    = None
+    final_score:       Optional[float]                  = None
+    lipinski:          Optional[LipinskiResult]         = None
+    admet:             Optional[ADMETResult]            = None
     binding_prefilter: Optional[BindingPrefilterResult] = None
-    docking:          Optional[DockingResult]          = None
-    retrosynthesis:   Optional[RetrosynthesisResult]   = None
+    docking:           Optional[DockingResult]          = None
+    retrosynthesis:    Optional[RetrosynthesisResult]   = None
 
 
 # ── Job responses ─────────────────────────────────────────────────────────────

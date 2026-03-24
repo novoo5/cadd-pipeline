@@ -1,5 +1,5 @@
 """
-Exhaustive analogue generator supporting up to 1000 compounds.
+Exhaustive analogue generator supporting up to 10000 compounds.
 
 Strategy stack (applied in order, then looped with 2nd-order mutations):
   1. BRICS fragmentation + recombination  (chemically valid, diverse)
@@ -56,16 +56,12 @@ _SOLUBILITY_THRESHOLDS = {
 
 def _is_valid(
     mol,
-    base_canonical:   str,
-    seen:             Set[str],
-    logs_threshold:   float,
-    min_mw:           float,
-    max_mw:           float,
+    base_canonical: str,
+    seen:           Set[str],
+    logs_threshold: float,
+    min_mw:         float,
+    max_mw:         float,
 ) -> Optional[str]:
-    """
-    Sanitise, canonicalise, then run MW + solubility checks.
-    Returns canonical SMILES if valid and not yet seen, else None.
-    """
     if mol is None:
         return None
     try:
@@ -139,7 +135,6 @@ _FG_MUTATIONS = [
 def _fg_mutation_batch(mol, target: int, base_canonical: str, seen: Set[str],
                        logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
     results = []
-    # Shuffle so repeated calls with same mol get different products first
     mutations = random.sample(_FG_MUTATIONS, len(_FG_MUTATIONS))
     for smarts, replacement in mutations:
         if len(results) >= target:
@@ -239,20 +234,17 @@ def _rwmol_mutations_batch(mol, target: int, base_canonical: str, seen: Set[str]
         sym = atom.GetSymbol()
         idx = atom.GetIdx()
 
-        # Atom substitution (non-ring)
         if sym in _ATOM_SUBS and not atom.IsInRing():
             rep = random.choice(_ATOM_SUBS[sym])
             def _sub(rw, _idx=idx, _rep=rep):
                 rw.GetAtomWithIdx(_idx).SetAtomicNum(_PERIODIC.GetAtomicNumber(_rep))
             _try_rw(_sub)
 
-        # Aza-scan (aromatic C → N)
         if sym == "C" and atom.GetIsAromatic() and atom.IsInRing():
             def _aza(rw, _idx=idx):
                 rw.GetAtomWithIdx(_idx).SetAtomicNum(7)
             _try_rw(_aza)
 
-        # Halogen swap
         if sym in ("F", "Cl", "Br"):
             hals = [x for x in ("F", "Cl", "Br") if x != sym]
             rep  = random.choice(hals)
@@ -260,7 +252,6 @@ def _rwmol_mutations_batch(mol, target: int, base_canonical: str, seen: Set[str]
                 rw.GetAtomWithIdx(_idx).SetAtomicNum(_PERIODIC.GetAtomicNumber(_rep))
             _try_rw(_hal)
 
-        # Halogen add to aromatic C-H
         if sym == "C" and atom.GetIsAromatic() and atom.GetTotalNumHs() > 0:
             hal = random.choice(["F", "Cl", "Br"])
             def _hadd(rw, _idx=idx, _hal=hal):
@@ -297,33 +288,28 @@ def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
         sym = atom.GetSymbol()
         idx = atom.GetIdx()
 
-        # Methyl add
         if sym in ("C", "N") and not atom.GetIsAromatic() and atom.GetTotalNumHs() > 0:
             def _madd(rw, _idx=idx):
                 c = rw.AddAtom(Chem.Atom("C"))
                 rw.AddBond(_idx, c, BondType.SINGLE)
             _try_rw(_madd)
 
-        # Methyl remove (terminal CH3)
         if sym == "C" and atom.GetDegree() == 1 and atom.GetTotalNumHs() == 3:
             def _mrem(rw, _idx=idx):
                 rw.RemoveAtom(_idx)
             _try_rw(_mrem)
 
-        # Chain extend
         if sym == "C" and not atom.GetIsAromatic() and atom.GetDegree() <= 3 and atom.GetTotalNumHs() > 0:
             def _cext(rw, _idx=idx):
                 c = rw.AddAtom(Chem.Atom("C"))
                 rw.AddBond(_idx, c, BondType.SINGLE)
             _try_rw(_cext)
 
-        # Chain shorten (terminal non-aromatic C with ≥2 Hs)
         if sym == "C" and not atom.GetIsAromatic() and atom.GetDegree() == 1 and atom.GetTotalNumHs() >= 2:
             def _csh(rw, _idx=idx):
                 rw.RemoveAtom(_idx)
             _try_rw(_csh)
 
-        # OH add to aromatic C-H
         if sym == "C" and atom.GetIsAromatic() and atom.GetTotalNumHs() > 0:
             def _ohadd(rw, _idx=idx):
                 o = rw.AddAtom(Chem.Atom("O"))
@@ -336,19 +322,19 @@ def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def generate_analogues(
-    base_smiles:              str,
-    num_analogues:            int,
-    filter_solubility:        str   = "all",
-    min_mw:                   float = 100.0,
-    max_mw:                   float = 800.0,
-    max_attempts_multiplier:  int   = 40,
+    base_smiles:             str,
+    num_analogues:           int,
+    filter_solubility:       str   = "all",
+    min_mw:                  float = 100.0,
+    max_mw:                  float = 800.0,
+    max_attempts_multiplier: int   = 40,
 ) -> List[str]:
     """
     Generate up to num_analogues unique analogues of base_smiles.
 
     Args:
         base_smiles:             Input SMILES.
-        num_analogues:           Target count (1–1000).
+        num_analogues:           Target count (1–10000).
         filter_solubility:       "soluble_only" | "allow_slightly" | "all"
         min_mw / max_mw:         MW window for acceptance.
         max_attempts_multiplier: Total strategy loop budget = n × multiplier.
@@ -366,36 +352,40 @@ def generate_analogues(
     seen: Set[str]    = {base_canonical}
     results: List[str] = []
 
-    # ── Pass 1: all 5 strategies on the base molecule ─────────────────────────
-    remaining = num_analogues - len(results)
+    # ── Scale multiplier down at high counts to keep runtime sane ────────────
+    if num_analogues > 5000:
+        max_attempts_multiplier = 8
+    elif num_analogues > 2000:
+        max_attempts_multiplier = 12
+    elif num_analogues > 1000:
+        max_attempts_multiplier = 20
+    elif num_analogues > 500:
+        max_attempts_multiplier = 25
+    elif num_analogues > 200:
+        max_attempts_multiplier = 30
+    # ≤200 keeps the default 40×
 
-    # 1. BRICS
-    batch = _brics_batch(base_mol, remaining, base_canonical, seen, logs_threshold, min_mw, max_mw)
+    # ── Pass 1: all 5 strategies on the base molecule ─────────────────────────
+    batch = _brics_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
     results.extend(batch)
 
-    # 2. FG mutations
     if len(results) < num_analogues:
         batch = _fg_mutation_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
 
-    # 3. Substituent additions
     if len(results) < num_analogues:
         batch = _substituent_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
 
-    # 4. RWMol atom mutations
     if len(results) < num_analogues:
         batch = _rwmol_mutations_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
 
-    # 5. Chain edits
     if len(results) < num_analogues:
         batch = _chain_edits_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
         results.extend(batch)
 
-    # ── Pass 2+: 2nd-order mutations from accepted analogues ─────────────────
-    # Keeps looping until budget exhausted or target hit.
-    # Each round picks random accepted analogues as new parents.
+    # ── Pass 2+: 2nd-order mutations from accepted analogues ──────────────────
     budget = num_analogues * max_attempts_multiplier
     iters  = 0
 
@@ -404,7 +394,6 @@ def generate_analogues(
         if not results:
             break
 
-        # Pick a random accepted analogue as parent for this iteration
         parent_smi = random.choice(results)
         parent_mol = Chem.MolFromSmiles(parent_smi)
         if parent_mol is None:
