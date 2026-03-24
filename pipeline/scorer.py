@@ -1,14 +1,14 @@
-from typing import List, Optional
+from typing import List
 from backend.models.schemas import CompoundResult
 
 
-# ── Scoring weights (must sum to 100) ───────────────────────────────────────
+# ── Scoring weights (must sum to 100) ─────────────────────────────────────────
 WEIGHTS = {
-    "docking_affinity":    50,
-    "admet_safety":        20,
-    "solubility":          10,
-    "binding_prefilter":   10,
-    "synthesis_ease":      10,
+    "docking_affinity":  50,
+    "admet_safety":      20,
+    "solubility":        10,
+    "binding_prefilter": 10,
+    "synthesis_ease":    10,
 }
 
 assert sum(WEIGHTS.values()) == 100, "Scoring weights must sum to 100"
@@ -19,12 +19,25 @@ AFFINITY_WORST =  -3.0
 COMPLEXITY_BEST  = 20.0
 COMPLEXITY_WORST = 60.0
 
+# Point contribution (out of 10) per solubility class
 SOLUBILITY_SCORES = {
-    "High":      1.0,
-    "Medium":    0.7,
-    "Low":       0.3,
-    "Very Low":  0.0,
-    "Invalid":   0.0,
+    "High":     1.0,
+    "Medium":   0.7,
+    "Low":      0.3,
+    "Very Low": 0.0,
+    "Invalid":  0.0,
+}
+
+# ← NEW: global score multipliers applied AFTER dynamic reweighting
+# These penalise insoluble compounds even when docking score is high.
+# "Very Low" is a hard 55% multiplier — a strong binder that can't dissolve
+# is clinically irrelevant.  "Low" applies a softer 80% multiplier.
+SOLUBILITY_MULTIPLIERS = {
+    "High":     1.00,
+    "Medium":   1.00,
+    "Low":      0.80,   # ← -20% on final score
+    "Very Low": 0.55,   # ← -45% on final score
+    "Invalid":  0.55,
 }
 
 MW_MIN = 200.0
@@ -42,57 +55,64 @@ def score_and_rank(compounds: List[CompoundResult]) -> List[CompoundResult]:
 
 
 def _compute_score(c: CompoundResult) -> float:
-    earned = 0.0
+    earned   = 0.0
     possible = 0.0
 
-    # ── 1. Docking affinity (50 pts) ─────────────────────────────────────────
+    # ── 1. Docking affinity (50 pts) ──────────────────────────────────────────
     if c.docking and c.docking.best_affinity_kcal != 0.0:
         aff = c.docking.best_affinity_kcal
-        earned += _normalize(aff, AFFINITY_WORST, AFFINITY_BEST) * WEIGHTS["docking_affinity"]
+        earned   += _normalize(aff, AFFINITY_WORST, AFFINITY_BEST) * WEIGHTS["docking_affinity"]
         possible += WEIGHTS["docking_affinity"]
 
     # ── 2. ADMET safety (20 pts) ──────────────────────────────────────────────
     if c.admet:
+        # ← flags is List[ADMETFlagDetail] — use .flag_summary for display, len() for count
         num_flags = len(c.admet.flags)
-        safety_scores = {0: 1.0, 1: 0.6, 2: 0.3}
-        norm = safety_scores.get(num_flags, 0.0)
+        safety_map = {0: 1.0, 1: 0.6, 2: 0.3}
+        norm = safety_map.get(num_flags, 0.0)
         herg_penalty = max(0.0, c.admet.herg_inhibition - 0.3) * 2.0
         norm = max(0.0, norm - herg_penalty)
-        earned += norm * WEIGHTS["admet_safety"]
+        earned   += norm * WEIGHTS["admet_safety"]
         possible += WEIGHTS["admet_safety"]
 
-    # ── 3. Solubility (10 pts) — always runs, drug-likeness is locked on ──────
+    # ── 3. Solubility (10 pts) ────────────────────────────────────────────────
     if c.lipinski:
-        sol_norm = SOLUBILITY_SCORES.get(c.lipinski.solubility_class, 0.0)
-        earned += sol_norm * WEIGHTS["solubility"]
+        sol_norm  = SOLUBILITY_SCORES.get(c.lipinski.solubility_class, 0.0)
+        earned   += sol_norm * WEIGHTS["solubility"]
         possible += WEIGHTS["solubility"]
 
     # ── 4. Binding prefilter GNN score (10 pts) ───────────────────────────────
     if c.binding_prefilter and c.binding_prefilter.confidence >= 0.4:
         pre = c.binding_prefilter.predicted_affinity_kcal
         norm = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
-        earned += norm * WEIGHTS["binding_prefilter"]
+        earned   += norm * WEIGHTS["binding_prefilter"]
         possible += WEIGHTS["binding_prefilter"]
 
     # ── 5. Synthesis ease (10 pts) ────────────────────────────────────────────
     if c.retrosynthesis and c.retrosynthesis.feasible:
         comp = c.retrosynthesis.complexity_score
         norm = _normalize(comp, COMPLEXITY_WORST, COMPLEXITY_BEST)
-        earned += norm * WEIGHTS["synthesis_ease"]
+        earned   += norm * WEIGHTS["synthesis_ease"]
         possible += WEIGHTS["synthesis_ease"]
     elif c.retrosynthesis and not c.retrosynthesis.feasible:
-        # ran but infeasible — penalise but count it as attempted
-        possible += WEIGHTS["synthesis_ease"]
+        possible += WEIGHTS["synthesis_ease"]   # ran but infeasible — count attempted
 
     if possible == 0.0:
         return 0.0
 
-    # ── Dynamic reweighting: scale to 100 based on which steps ran ───────────
+    # ── Dynamic reweighting: scale to 100 based on which steps ran ────────────
     scaled = (earned / possible) * 100.0
 
     # ── MW fragment penalty ───────────────────────────────────────────────────
     if c.lipinski and c.lipinski.mw < MW_MIN:
         scaled *= 0.5
+
+    # ── Solubility multiplier penalty ─────────────────────────────────────────
+    # Applied AFTER reweighting so it reduces the final 0–100 score directly.
+    # Prevents insoluble compounds from ranking high on docking alone.
+    if c.lipinski:
+        sol_mult = SOLUBILITY_MULTIPLIERS.get(c.lipinski.solubility_class, 1.0)
+        scaled  *= sol_mult
 
     return round(min(max(scaled, 0.0), 100.0), 2)
 
@@ -100,8 +120,7 @@ def _compute_score(c: CompoundResult) -> float:
 def _normalize(value: float, worst: float, best: float) -> float:
     if best == worst:
         return 0.0
-    norm = (value - worst) / (best - worst)
-    return min(max(norm, 0.0), 1.0)
+    return min(max((value - worst) / (best - worst), 0.0), 1.0)
 
 
 def get_score_breakdown(compound: CompoundResult) -> dict:
@@ -109,39 +128,46 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
     breakdown = {}
 
     if c.docking and c.docking.best_affinity_kcal != 0.0:
-        aff = c.docking.best_affinity_kcal
+        aff  = c.docking.best_affinity_kcal
         norm = _normalize(aff, AFFINITY_WORST, AFFINITY_BEST)
         breakdown["docking_affinity"] = {
-            "raw": f"{aff} kcal/mol",
+            "raw":          f"{aff} kcal/mol",
             "contribution": round(norm * WEIGHTS["docking_affinity"], 2),
             "max_possible": WEIGHTS["docking_affinity"],
         }
 
     if c.admet:
         num_flags = len(c.admet.flags)
-        safety_scores = {0: 1.0, 1: 0.6, 2: 0.3}
-        norm = safety_scores.get(num_flags, 0.0)
+        safety_map = {0: 1.0, 1: 0.6, 2: 0.3}
+        norm = safety_map.get(num_flags, 0.0)
         herg_penalty = max(0.0, c.admet.herg_inhibition - 0.3) * 2.0
         norm = max(0.0, norm - herg_penalty)
+
+        # ← FIXED: use flag_summary (List[str]) for joining — not flags (List[ADMETFlagDetail])
+        flag_text = ", ".join(c.admet.flag_summary) if c.admet.flag_summary else "None"
+
         breakdown["admet_safety"] = {
-            "raw": f"{num_flags} flag(s): {', '.join(c.admet.flags) or 'None'}",
+            "raw":          f"{num_flags} flag(s): {flag_text}",
             "contribution": round(norm * WEIGHTS["admet_safety"], 2),
             "max_possible": WEIGHTS["admet_safety"],
         }
 
     if c.lipinski:
-        sol_norm = SOLUBILITY_SCORES.get(c.lipinski.solubility_class, 0.0)
+        sol_class = c.lipinski.solubility_class
+        sol_norm  = SOLUBILITY_SCORES.get(sol_class, 0.0)
+        sol_mult  = SOLUBILITY_MULTIPLIERS.get(sol_class, 1.0)
+        mult_note = f" — {int((1 - sol_mult) * 100)}% final score penalty" if sol_mult < 1.0 else ""
         breakdown["solubility"] = {
-            "raw": f"{c.lipinski.solubility_class} (LogS={c.lipinski.logs})",
+            "raw":          f"{sol_class} (LogS={c.lipinski.logs:.2f}){mult_note}",
             "contribution": round(sol_norm * WEIGHTS["solubility"], 2),
             "max_possible": WEIGHTS["solubility"],
         }
 
     if c.binding_prefilter and c.binding_prefilter.confidence >= 0.4:
-        pre = c.binding_prefilter.predicted_affinity_kcal
+        pre  = c.binding_prefilter.predicted_affinity_kcal
         norm = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
         breakdown["binding_prefilter"] = {
-            "raw": f"{pre} kcal/mol (confidence={c.binding_prefilter.confidence:.2f})",
+            "raw":          f"{pre} kcal/mol (confidence={c.binding_prefilter.confidence:.2f})",
             "contribution": round(norm * WEIGHTS["binding_prefilter"], 2),
             "max_possible": WEIGHTS["binding_prefilter"],
         }
@@ -151,18 +177,17 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
             comp = c.retrosynthesis.complexity_score
             norm = _normalize(comp, COMPLEXITY_WORST, COMPLEXITY_BEST)
             breakdown["synthesis_ease"] = {
-                "raw": f"Complexity={comp}, Steps={c.retrosynthesis.num_steps}",
+                "raw":          f"Complexity={comp:.1f}, Steps={c.retrosynthesis.num_steps}",
                 "contribution": round(norm * WEIGHTS["synthesis_ease"], 2),
                 "max_possible": WEIGHTS["synthesis_ease"],
             }
         else:
             breakdown["synthesis_ease"] = {
-                "raw": "Synthesis infeasible",
+                "raw":          "Synthesis infeasible",
                 "contribution": 0.0,
                 "max_possible": WEIGHTS["synthesis_ease"],
             }
 
-    mw_penalty_applied = (c.lipinski and c.lipinski.mw < MW_MIN)
-    breakdown["mw_fragment_penalty"] = mw_penalty_applied
-    breakdown["final_score"] = c.final_score
+    breakdown["mw_fragment_penalty"] = bool(c.lipinski and c.lipinski.mw < MW_MIN)
+    breakdown["final_score"]         = c.final_score
     return breakdown
