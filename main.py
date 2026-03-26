@@ -26,17 +26,16 @@ def _write_initial_status(job_id: str, request: JobRequest):
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    now = datetime.now(timezone.utc).isoformat()
-    ps  = request.pipeline_steps
-
-    # In toxicity_report_only mode steps 2/4/5/6 are pre-marked skipped
+    now      = datetime.now(timezone.utc).isoformat()
+    ps       = request.pipeline_steps
     tox_only = request.toxicity_report_only
 
     steps = [
-        {"name": "Analogue Generation",               "status": "waiting"},
+        {"name": "Analogue Generation",                    "status": "waiting"},
         {"name": "Drug-likeness Filter (Lipinski + ESOL)",
          "status": "skipped" if tox_only else ("waiting" if ps.drug_likeness else "skipped")},
-        {"name": "ADMET Toxicity Filter",              "status": "waiting" if ps.admet else "skipped"},
+        {"name": "ADMET Toxicity Filter",
+         "status": "waiting" if ps.admet else "skipped"},
         {"name": "ML Binding Pre-filter",
          "status": "skipped" if tox_only else ("waiting" if ps.binding_prefilter else "skipped")},
         {"name": "Protein Preparation",
@@ -45,7 +44,7 @@ def _write_initial_status(job_id: str, request: JobRequest):
          "status": "skipped" if tox_only else ("waiting" if ps.docking else "skipped")},
         {"name": "Retrosynthesis (SA Score)",
          "status": "skipped" if tox_only else ("waiting" if ps.retrosynthesis else "skipped")},
-        {"name": "Scoring & Ranking",                  "status": "waiting"},
+        {"name": "Scoring & Ranking",                      "status": "waiting"},
     ]
 
     status_payload = {
@@ -120,8 +119,9 @@ async def submit_job(request: JobRequest):
     Submit a pipeline job via JSON body.
 
     New fields:
-      solubility_filter    — "soluble_only" | "allow_slightly" | "all"
-      toxicity_report_only — true = ADMET-only, no PDB required
+      solubility_filter       — "soluble_only" | "allow_slightly" | "all"
+      toxicity_report_only    — true = ADMET-only, no PDB required
+      locked_scaffold_smarts  — SMARTS pattern; analogues missing this are rejected
     """
     job_id = str(uuid.uuid4())
     _write_initial_status(job_id, request)
@@ -139,39 +139,40 @@ async def submit_job(request: JobRequest):
 
 @app.post("/api/v1/jobs/upload", response_model=JobSubmitResponse)
 async def submit_job_with_file(
-    smiles:                  str            = Form(...),
-    num_analogues:           int            = Form(25),       # 0–1000
-    docking_speed:           str            = Form("balanced"),
-    binding_site_mode:       str            = Form("auto"),
-    direct_score_only:       bool           = Form(False),
-    mw_min:                  float          = Form(200.0),
-    mw_max:                  float          = Form(500.0),
-    # Frontend sends -1 to represent None ("ignore filter")
-    max_lipinski_violations: Optional[int]  = Form(1),
-    # ── NEW ──────────────────────────────────────────────────────────────────
-    solubility_filter:       str            = Form("all"),
-    toxicity_report_only:    bool           = Form(False),
-    # ─────────────────────────────────────────────────────────────────────────
-    pdb_id:                  Optional[str]  = Form(None),
-    pdb_file:                UploadFile     = File(None),
+    smiles:                  str           = Form(...),
+    num_analogues:           int           = Form(25),
+    docking_speed:           str           = Form("balanced"),
+    binding_site_mode:       str           = Form("auto"),
+    direct_score_only:       bool          = Form(False),
+    mw_min:                  float         = Form(200.0),
+    mw_max:                  float         = Form(500.0),
+    max_lipinski_violations: Optional[int] = Form(1),
+    solubility_filter:       str           = Form("all"),
+    toxicity_report_only:    bool          = Form(False),
+    locked_scaffold_smarts:  Optional[str] = Form(None),   # ← NEW
+    pdb_id:                  Optional[str] = Form(None),
+    pdb_file:                UploadFile    = File(None),
 ):
     """
     Submit a pipeline job via multipart/form-data (for .pdb file uploads).
 
     solubility_filter:
-        "soluble_only"    — only logS > -3 analogues are generated
-        "allow_slightly"  — logS > -5 (also slightly soluble)
-        "all"             — no filter (default)
+        "soluble_only"   — only logS > -3 analogues pass
+        "allow_slightly" — logS > -5
+        "all"            — no filter (default)
 
     toxicity_report_only:
-        true  — skip docking/retrosynthesis; run ADMET only; PDB not required
+        true  — ADMET only; no PDB required
         false — full pipeline (default)
+
+    locked_scaffold_smarts:
+        SMARTS pattern — any analogue that doesn't contain this substructure
+        is rejected at generation time. Leave None to disable.
     """
     from backend.models.schemas import (
         PipelineSteps, BindingSiteMode, DockingSpeed, SolubilityFilterMode
     )
 
-    # PDB required only when docking is going to run
     needs_pdb = not toxicity_report_only
     if needs_pdb and pdb_id is None and pdb_file is None:
         raise HTTPException(
@@ -182,7 +183,6 @@ async def submit_job_with_file(
             ),
         )
 
-    # Parse uploaded PDB file
     pdb_content: Optional[str] = None
     if pdb_file is not None:
         if not pdb_file.filename.endswith(".pdb"):
@@ -198,18 +198,21 @@ async def submit_job_with_file(
                 detail="Uploaded PDB file appears to be empty or too small.",
             )
 
-    # Validate solubility_filter value before passing to schema
     try:
         sol_filter = SolubilityFilterMode(solubility_filter)
     except ValueError:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid solubility_filter '{solubility_filter}'. "
-                   f"Must be one of: soluble_only, allow_slightly, all.",
+            detail=(
+                f"Invalid solubility_filter '{solubility_filter}'. "
+                f"Must be one of: soluble_only, allow_slightly, all."
+            ),
         )
 
-    # -1 from frontend = None ("ignore Lipinski filter entirely")
     resolved_violations = None if max_lipinski_violations == -1 else max_lipinski_violations
+
+    # ← strip to None if frontend sent an empty string
+    scaffold_smarts = locked_scaffold_smarts.strip() if locked_scaffold_smarts else None
 
     request = JobRequest(
         smiles                  = smiles,
@@ -217,8 +220,9 @@ async def submit_job_with_file(
         pdb_content             = pdb_content,
         num_analogues           = 0 if direct_score_only else num_analogues,
         direct_score_only       = direct_score_only,
-        solubility_filter       = sol_filter,           # ← NEW
-        toxicity_report_only    = toxicity_report_only, # ← NEW
+        solubility_filter       = sol_filter,
+        toxicity_report_only    = toxicity_report_only,
+        locked_scaffold_smarts  = scaffold_smarts,         # ← NEW
         pipeline_steps          = PipelineSteps(),
         binding_site_mode       = BindingSiteMode(binding_site_mode),
         docking_speed           = DockingSpeed(docking_speed),
