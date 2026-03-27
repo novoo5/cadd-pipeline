@@ -1,5 +1,5 @@
-from typing import List
-from backend.models.schemas import CompoundResult
+from typing import List, Optional
+from backend.models.schemas import CompoundResult, PipelineSteps
 
 
 # ── Scoring weights (must sum to 100) ─────────────────────────────────────────
@@ -38,9 +38,12 @@ SOLUBILITY_MULTIPLIERS = {
 MW_MIN = 200.0
 
 
-def score_and_rank(compounds: List[CompoundResult]) -> List[CompoundResult]:
+def score_and_rank(
+    compounds:      List[CompoundResult],
+    pipeline_steps: Optional[PipelineSteps] = None,   # ← NEW
+) -> List[CompoundResult]:
     for compound in compounds:
-        compound.final_score = _compute_score(compound)
+        compound.final_score = _compute_score(compound, pipeline_steps)
 
     ranked = sorted(compounds, key=lambda c: c.final_score or 0.0, reverse=True)
     for rank, compound in enumerate(ranked, start=1):
@@ -53,9 +56,8 @@ def _docking_was_queued(c: CompoundResult) -> bool:
     """
     Returns True if docking was supposed to run for this compound but didn't
     complete — i.e. it passed the binding prefilter but has no docking result.
-    This happens when the job times out mid-docking.
-    Distinguished from intentionally-disabled docking (where prefilter also
-    wouldn't have a .passed=True result selected for docking).
+    Used only in get_score_breakdown() for human-readable explanation.
+    The actual score gate is in _compute_score() via pipeline_steps.
     """
     return (
         c.binding_prefilter is not None
@@ -64,7 +66,18 @@ def _docking_was_queued(c: CompoundResult) -> bool:
     )
 
 
-def _compute_score(c: CompoundResult) -> float:
+def _compute_score(
+    c:              CompoundResult,
+    pipeline_steps: Optional[PipelineSteps] = None,   # ← NEW
+) -> float:
+
+    # ── Hard zero: docking was enabled but compound has no docking result ─────
+    # Covers ALL cases: timeout, pre-filter wiped everything, crash, etc.
+    # A compound that never docked cannot outrank compounds that did.
+    if pipeline_steps is not None and pipeline_steps.docking and c.docking is None:
+        return 0.0
+    # ─────────────────────────────────────────────────────────────────────────
+
     earned   = 0.0
     possible = 0.0
 
@@ -74,9 +87,9 @@ def _compute_score(c: CompoundResult) -> float:
         earned   += _normalize(aff, AFFINITY_WORST, AFFINITY_BEST) * WEIGHTS["docking_affinity"]
         possible += WEIGHTS["docking_affinity"]
     elif _docking_was_queued(c):
-        # ← FIX: docking timed out / crashed — award 0 pts but count weight as possible
-        # This prevents dynamic reweighting from inflating undocked compounds to ~90 pts
-        possible += WEIGHTS["docking_affinity"]   # earned stays 0
+        # Fallback when pipeline_steps not passed in (legacy calls):
+        # award 0 pts but count weight as possible so score isn't inflated
+        possible += WEIGHTS["docking_affinity"]
 
     # ── 2. ADMET safety (20 pts) ──────────────────────────────────────────────
     if c.admet:
@@ -138,19 +151,27 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
     c         = compound
     breakdown = {}
 
+    if pipeline_steps_docking_enabled := (c.docking is None):
+        # Show hard-zero reason if docking was expected
+        if _docking_was_queued(c):
+            breakdown["docking_affinity"] = {
+                "raw":          "Docking did not complete (job timeout) — 0 pts, compound excluded from ranking",
+                "contribution": 0.0,
+                "max_possible": WEIGHTS["docking_affinity"],
+            }
+        elif c.docking is None:
+            breakdown["docking_affinity"] = {
+                "raw":          "No docking result — compound scored 0 and excluded from ranking",
+                "contribution": 0.0,
+                "max_possible": WEIGHTS["docking_affinity"],
+            }
+    
     if c.docking and c.docking.best_affinity_kcal != 0.0:
         aff  = c.docking.best_affinity_kcal
         norm = _normalize(aff, AFFINITY_WORST, AFFINITY_BEST)
         breakdown["docking_affinity"] = {
             "raw":          f"{aff} kcal/mol",
             "contribution": round(norm * WEIGHTS["docking_affinity"], 2),
-            "max_possible": WEIGHTS["docking_affinity"],
-        }
-    elif _docking_was_queued(c):
-        # ← FIX: show clearly in breakdown that docking timed out
-        breakdown["docking_affinity"] = {
-            "raw":          "Docking did not complete (job timeout) — 0 pts awarded",
-            "contribution": 0.0,
             "max_possible": WEIGHTS["docking_affinity"],
         }
 

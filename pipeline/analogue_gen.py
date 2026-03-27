@@ -12,12 +12,15 @@ Solubility filter (Delaney ESOL) is applied at generation time when requested.
 modes: "soluble_only" (logS > -3) | "allow_slightly" (logS > -5) | "all" (no filter)
 """
 
+import logging
 import random
-from typing import List, Set, Optional, Callable  # ← added Callable
+from typing import List, Set, Optional, Callable
 from rdkit import Chem
 from rdkit.Chem import BRICS, AllChem, Descriptors, rdMolDescriptors
 from rdkit.Chem.rdchem import RWMol, BondType
 from backend.utils.smiles_validator import smiles_to_mol, mol_to_smiles
+
+logger = logging.getLogger(__name__)
 
 
 # ── Solubility (Delaney ESOL) ─────────────────────────────────────────────────
@@ -61,6 +64,7 @@ def _is_valid(
     logs_threshold: float,
     min_mw:         float,
     max_mw:         float,
+    scaffold_mol=None,          # ← NEW: compiled RDKit Mol from SMARTS, or None
 ) -> Optional[str]:
     if mol is None:
         return None
@@ -77,6 +81,11 @@ def _is_valid(
             return None
         if logs_threshold > -90.0 and esol_logS(mol) < logs_threshold:
             return None
+        # ── Scaffold lock: hard reject if substructure missing ────────────────
+        if scaffold_mol is not None:
+            if not mol.HasSubstructMatch(scaffold_mol):
+                return None
+        # ─────────────────────────────────────────────────────────────────────
         return smi
     except Exception:
         return None
@@ -84,8 +93,11 @@ def _is_valid(
 
 # ── Strategy 1: BRICS ─────────────────────────────────────────────────────────
 
-def _brics_batch(mol, target: int, base_canonical: str, seen: Set[str],
-                 logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+def _brics_batch(
+    mol, target: int, base_canonical: str, seen: Set[str],
+    logs_threshold: float, min_mw: float, max_mw: float,
+    scaffold_mol=None,          # ← NEW
+) -> List[str]:
     results = []
     try:
         fragments = list(BRICS.BRICSDecompose(mol))
@@ -104,7 +116,7 @@ def _brics_batch(mol, target: int, base_canonical: str, seen: Set[str],
                 chosen   = random.sample(frag_mols, min(2, len(frag_mols)))
                 new_mols = list(BRICS.BRICSBuild(chosen))
                 for new_mol in new_mols:
-                    smi = _is_valid(new_mol, base_canonical, seen, logs_threshold, min_mw, max_mw)
+                    smi = _is_valid(new_mol, base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
                     if smi:
                         seen.add(smi)
                         results.append(smi)
@@ -132,8 +144,11 @@ _FG_MUTATIONS = [
 ]
 
 
-def _fg_mutation_batch(mol, target: int, base_canonical: str, seen: Set[str],
-                       logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+def _fg_mutation_batch(
+    mol, target: int, base_canonical: str, seen: Set[str],
+    logs_threshold: float, min_mw: float, max_mw: float,
+    scaffold_mol=None,          # ← NEW
+) -> List[str]:
     results = []
     mutations = random.sample(_FG_MUTATIONS, len(_FG_MUTATIONS))
     for smarts, replacement in mutations:
@@ -146,7 +161,7 @@ def _fg_mutation_batch(mol, target: int, base_canonical: str, seen: Set[str],
                 continue
             products = AllChem.ReplaceSubstructs(mol, pattern, repl_mol)
             for product in products:
-                smi = _is_valid(product, base_canonical, seen, logs_threshold, min_mw, max_mw)
+                smi = _is_valid(product, base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
                 if smi:
                     seen.add(smi)
                     results.append(smi)
@@ -172,8 +187,11 @@ _SUBSTITUENTS = [
 ]
 
 
-def _substituent_batch(mol, target: int, base_canonical: str, seen: Set[str],
-                       logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+def _substituent_batch(
+    mol, target: int, base_canonical: str, seen: Set[str],
+    logs_threshold: float, min_mw: float, max_mw: float,
+    scaffold_mol=None,          # ← NEW
+) -> List[str]:
     results = []
     pattern = Chem.MolFromSmarts("[cH]")
     if pattern is None:
@@ -188,7 +206,7 @@ def _substituent_batch(mol, target: int, base_canonical: str, seen: Set[str],
                 continue
             products = AllChem.ReplaceSubstructs(mol, pattern, sub_mol, replaceAll=False)
             for product in products:
-                smi = _is_valid(product, base_canonical, seen, logs_threshold, min_mw, max_mw)
+                smi = _is_valid(product, base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
                 if smi:
                     seen.add(smi)
                     results.append(smi)
@@ -210,8 +228,11 @@ _ATOM_SUBS = {
 _PERIODIC = Chem.GetPeriodicTable()
 
 
-def _rwmol_mutations_batch(mol, target: int, base_canonical: str, seen: Set[str],
-                           logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+def _rwmol_mutations_batch(
+    mol, target: int, base_canonical: str, seen: Set[str],
+    logs_threshold: float, min_mw: float, max_mw: float,
+    scaffold_mol=None,          # ← NEW
+) -> List[str]:
     results = []
     atoms = list(mol.GetAtoms())
 
@@ -220,7 +241,7 @@ def _rwmol_mutations_batch(mol, target: int, base_canonical: str, seen: Set[str]
         try:
             func(rw)
             Chem.SanitizeMol(rw)
-            smi = _is_valid(rw.GetMol(), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            smi = _is_valid(rw.GetMol(), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
             if smi:
                 seen.add(smi)
                 results.append(smi)
@@ -264,8 +285,11 @@ def _rwmol_mutations_batch(mol, target: int, base_canonical: str, seen: Set[str]
 
 # ── Strategy 5: Side-chain edits ──────────────────────────────────────────────
 
-def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
-                       logs_threshold: float, min_mw: float, max_mw: float) -> List[str]:
+def _chain_edits_batch(
+    mol, target: int, base_canonical: str, seen: Set[str],
+    logs_threshold: float, min_mw: float, max_mw: float,
+    scaffold_mol=None,          # ← NEW
+) -> List[str]:
     results = []
     atoms = list(mol.GetAtoms())
     random.shuffle(atoms)
@@ -275,7 +299,7 @@ def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
         try:
             func(rw)
             Chem.SanitizeMol(rw)
-            smi = _is_valid(rw.GetMol(), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            smi = _is_valid(rw.GetMol(), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
             if smi:
                 seen.add(smi)
                 results.append(smi)
@@ -324,11 +348,12 @@ def _chain_edits_batch(mol, target: int, base_canonical: str, seen: Set[str],
 def generate_analogues(
     base_smiles:             str,
     num_analogues:           int,
-    filter_solubility:       str                              = "all",
-    min_mw:                  float                           = 100.0,
-    max_mw:                  float                           = 800.0,
-    max_attempts_multiplier: int                             = 40,
-    on_progress:             Optional[Callable[[int, int], None]] = None,  # ← NEW
+    filter_solubility:       str                               = "all",
+    min_mw:                  float                            = 100.0,
+    max_mw:                  float                            = 800.0,
+    max_attempts_multiplier: int                              = 40,
+    on_progress:             Optional[Callable[[int, int], None]] = None,
+    locked_scaffold_smarts:  Optional[str]                   = None,   # ← NEW
 ) -> List[str]:
     """
     Generate up to num_analogues unique analogues of base_smiles.
@@ -339,12 +364,14 @@ def generate_analogues(
         filter_solubility:       "soluble_only" | "allow_slightly" | "all"
         min_mw / max_mw:         MW window for acceptance.
         max_attempts_multiplier: Total strategy loop budget = n × multiplier.
-        on_progress:             Optional callback(current, total) fired every
-                                 10 new compounds — used for real-time UI updates.
+        on_progress:             Optional callback(current, total) every 10 new compounds.
+        locked_scaffold_smarts:  SMARTS pattern — any analogue missing this substructure
+                                 is hard-rejected. None = no lock.
 
     Returns:
         List of canonical SMILES (up to num_analogues, may be fewer if
-        chemical space is genuinely exhausted).
+        chemical space is exhausted or scaffold lock is very restrictive).
+        Returns [] if scaffold lock is set but 0 analogues pass.
     """
     base_mol = smiles_to_mol(base_smiles)
     if base_mol is None:
@@ -355,7 +382,27 @@ def generate_analogues(
     seen: Set[str]     = {base_canonical}
     results: List[str] = []
 
-    # ── Scale multiplier down at high counts to keep runtime sane ────────────
+    # ── Compile scaffold SMARTS once ─────────────────────────────────────────
+    scaffold_mol = None
+    if locked_scaffold_smarts and locked_scaffold_smarts.strip():
+        scaffold_mol = Chem.MolFromSmarts(locked_scaffold_smarts.strip())
+        if scaffold_mol is None:
+            logger.warning(
+                f"[analogue_gen] Invalid SMARTS '{locked_scaffold_smarts}' — "
+                f"scaffold lock disabled for this run."
+            )
+        else:
+            # Verify base molecule itself contains the scaffold —
+            # if not, warn early rather than silently returning 0 results
+            if not base_mol.HasSubstructMatch(scaffold_mol):
+                logger.warning(
+                    f"[analogue_gen] WARNING: Base molecule does NOT contain the locked "
+                    f"scaffold '{locked_scaffold_smarts}'. All analogues will be rejected. "
+                    f"Check your SMARTS or base SMILES."
+                )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Scale multiplier down at high counts ─────────────────────────────────
     if num_analogues > 5000:
         max_attempts_multiplier = 8
     elif num_analogues > 2000:
@@ -366,9 +413,8 @@ def generate_analogues(
         max_attempts_multiplier = 25
     elif num_analogues > 200:
         max_attempts_multiplier = 30
-    # ≤200 keeps the default 40×
 
-    # ── Progress reporter: fires every 10 new compounds ───────────────────────
+    # ── Progress reporter ─────────────────────────────────────────────────────
     _last_reported = [0]
 
     def _maybe_report():
@@ -379,27 +425,27 @@ def generate_analogues(
             _last_reported[0] = len(results)
 
     # ── Pass 1: all 5 strategies on the base molecule ─────────────────────────
-    batch = _brics_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+    batch = _brics_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
     results.extend(batch)
     _maybe_report()
 
     if len(results) < num_analogues:
-        batch = _fg_mutation_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        batch = _fg_mutation_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         results.extend(batch)
         _maybe_report()
 
     if len(results) < num_analogues:
-        batch = _substituent_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        batch = _substituent_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         results.extend(batch)
         _maybe_report()
 
     if len(results) < num_analogues:
-        batch = _rwmol_mutations_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        batch = _rwmol_mutations_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         results.extend(batch)
         _maybe_report()
 
     if len(results) < num_analogues:
-        batch = _chain_edits_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw)
+        batch = _chain_edits_batch(base_mol, num_analogues - len(results), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         results.extend(batch)
         _maybe_report()
 
@@ -421,18 +467,26 @@ def generate_analogues(
         need     = num_analogues - len(results)
 
         if strategy == 1:
-            batch = _brics_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            batch = _brics_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         elif strategy == 2:
-            batch = _fg_mutation_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            batch = _fg_mutation_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         elif strategy == 3:
-            batch = _substituent_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            batch = _substituent_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         elif strategy == 4:
-            batch = _rwmol_mutations_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            batch = _rwmol_mutations_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
         else:
-            batch = _chain_edits_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw)
+            batch = _chain_edits_batch(parent_mol, min(need, 5), base_canonical, seen, logs_threshold, min_mw, max_mw, scaffold_mol)
 
         results.extend(batch)
         _maybe_report()
+
+    # ── Scaffold lock: warn if nothing passed ─────────────────────────────────
+    if scaffold_mol is not None and len(results) == 0:
+        logger.warning(
+            f"[analogue_gen] Scaffold lock '{locked_scaffold_smarts}' matched 0 analogues "
+            f"after {iters} iterations. Returning empty list. "
+            f"Tip: verify SMARTS with RDKit or try a less restrictive pattern."
+        )
 
     return results[:num_analogues]
 

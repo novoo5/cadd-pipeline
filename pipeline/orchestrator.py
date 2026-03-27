@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
 
+
 from backend.models.schemas import (
     JobRequest, JobStatusResponse, JobResultsResponse,
     PipelineStepInfo, StepStatus, CompoundResult, BindingSiteInfo,
@@ -23,7 +24,9 @@ from backend.utils.pdb_fetcher import fetch_pdb_by_id, save_pdb_from_content
 from backend.utils.smiles_validator import validate_and_canonicalize
 
 
+
 JOBS_DIR = Path("storage/jobs")
+
 
 
 class PipelineOrchestrator:
@@ -36,7 +39,9 @@ class PipelineOrchestrator:
         self.steps: list[PipelineStepInfo] = []
         self._init_steps()
 
+
     # ── Step initialisation ───────────────────────────────────────────────────
+
 
     def _init_steps(self):
         step_names = [
@@ -53,7 +58,9 @@ class PipelineOrchestrator:
             self.steps.append(PipelineStepInfo(name=name, status=StepStatus.waiting))
         self._write_status("queued")
 
+
     # ── Status helpers ────────────────────────────────────────────────────────
+
 
     def _write_status(self, status: str, error: Optional[str] = None):
         payload = JobStatusResponse(
@@ -63,53 +70,65 @@ class PipelineOrchestrator:
         )
         (self.job_dir / "status.json").write_text(payload.model_dump_json(indent=2))
 
+
     def _step_start(self, index: int):
         self.steps[index].status = StepStatus.running
         self._write_status("running")
+
 
     def _step_done(self, index: int, message: str, elapsed: float):
         self.steps[index].status           = StepStatus.done
         self.steps[index].message          = message
         self.steps[index].duration_seconds = round(elapsed, 2)
-        self.steps[index].progress_current = None  # ← clear bar on completion
+        self.steps[index].progress_current = None
         self.steps[index].progress_total   = None
         self._write_status("running")
+
 
     def _step_skip(self, index: int, reason: str = "Disabled by user"):
         self.steps[index].status  = StepStatus.skipped
         self.steps[index].message = reason
         self._write_status("running")
 
+
     def _step_fail(self, index: int, error: str):
         self.steps[index].status  = StepStatus.failed
         self.steps[index].message = error
         self._write_status("failed", error=error)
 
-    # ← NEW: write live progress into a step and flush to disk
+
     def _update_step_progress(self, index: int, current: int, total: int):
         self.steps[index].progress_current = current
         self.steps[index].progress_total   = total
         self._write_status("running")
 
+
     # ── Main pipeline ─────────────────────────────────────────────────────────
+
 
     async def run(self):
         req = self.request
         compound_results:  dict[str, CompoundResult] = {}
         binding_site_info: Optional[BindingSiteInfo] = None
 
+        # ← FIX: read scaffold lock once so all three generate_analogues calls use it
+        locked_scaffold = getattr(req, "locked_scaffold_smarts", None) or None
+
+
         try:
             is_valid, canonical_smiles, err = validate_and_canonicalize(req.smiles)
             if not is_valid:
                 raise ValueError(f"Invalid SMILES: {err}")
 
+
             # ── STEP 1: Analogue Generation ───────────────────────────────────
             t = time.time()
             self._step_start(0)
 
-            # ← progress callback: fires every ~10 compounds found
+
             def analogue_progress(current: int, total: int):
                 self._update_step_progress(0, current, total)
+
 
             if req.toxicity_report_only:
                 if req.num_analogues > 0:
@@ -119,17 +138,20 @@ class PipelineOrchestrator:
                         req.num_analogues,
                         req.solubility_filter.value,
                         on_progress=analogue_progress,
+                        locked_scaffold_smarts=locked_scaffold,  # ← FIX
                     )
                     if not analogues:
                         analogues = [canonical_smiles]
                     if canonical_smiles not in analogues:
                         analogues = [canonical_smiles] + analogues
+
+                    scaffold_note = f" · scaffold locked" if locked_scaffold else ""  # ← FIX
                     self._step_done(
                         0,
                         (
                             f"Toxicity Report mode — {len(analogues)} compound(s) "
                             f"queued for ADMET screening "
-                            f"(base + {len(analogues) - 1} analogues)"
+                            f"(base + {len(analogues) - 1} analogues){scaffold_note}"
                         ),
                         time.time() - t,
                     )
@@ -141,6 +163,7 @@ class PipelineOrchestrator:
                         time.time() - t,
                     )
 
+
             elif req.direct_score_only:
                 analogues = [canonical_smiles]
                 self._step_done(
@@ -149,6 +172,7 @@ class PipelineOrchestrator:
                     time.time() - t,
                 )
 
+
             else:
                 analogues = await asyncio.to_thread(
                     generate_analogues,
@@ -156,6 +180,7 @@ class PipelineOrchestrator:
                     req.num_analogues,
                     req.solubility_filter.value,
                     on_progress=analogue_progress,
+                    locked_scaffold_smarts=locked_scaffold,  # ← FIX
                 )
                 if not analogues:
                     raise RuntimeError("Analogue generation produced 0 compounds.")
@@ -165,22 +190,27 @@ class PipelineOrchestrator:
                     if req.solubility_filter.value != "all"
                     else ""
                 )
+                scaffold_note = f" · scaffold locked" if locked_scaffold else ""  # ← FIX
                 self._step_done(
                     0,
-                    f"{len(analogues)}/{req.num_analogues} analogues generated{sol_note}",
+                    f"{len(analogues)}/{req.num_analogues} analogues generated{sol_note}{scaffold_note}",
                     time.time() - t,
                 )
 
+
             for smi in analogues:
                 compound_results[smi] = CompoundResult(smiles=smi, canonical_smiles=smi)
+
 
             # ── STEP 2: Drug-likeness Filter ──────────────────────────────────
             t = time.time()
             self._step_start(1)
 
+
             if req.toxicity_report_only:
                 self._step_skip(1, "Skipped — toxicity report mode screens all compounds")
                 surviving = analogues
+
 
             elif req.pipeline_steps.drug_likeness:
                 passed_lipinski, lipinski_results = filter_by_drug_likeness(
@@ -191,6 +221,7 @@ class PipelineOrchestrator:
                 )
                 for smi, result in zip(analogues, lipinski_results):
                     compound_results[smi].lipinski = result
+
 
                 sol_filter = req.solubility_filter.value if req.solubility_filter else "all"
                 if sol_filter != "all":
@@ -203,10 +234,12 @@ class PipelineOrchestrator:
                 else:
                     sol_label = ""
 
+
                 if req.max_lipinski_violations is None:
                     filter_label = "Lipinski filter ignored (all compounds pass)"
                 else:
                     filter_label = f"≤{req.max_lipinski_violations} violation(s) allowed"
+
 
                 self._step_done(
                     1,
@@ -218,11 +251,14 @@ class PipelineOrchestrator:
                 self._step_skip(1)
                 surviving = analogues
 
+
             if not surviving:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
 
+
             # ── STEP 3: ADMET ─────────────────────────────────────────────────
             t_pdb = time.time()
+
 
             if req.toxicity_report_only:
                 self._step_start(2)
@@ -232,6 +268,7 @@ class PipelineOrchestrator:
                 )
                 for smi, result in zip(surviving, admet_results):
                     compound_results[smi].admet = result
+
 
                 total_flags = sum(len(r.flags) for r in admet_results)
                 high_flags  = sum(
@@ -247,13 +284,16 @@ class PipelineOrchestrator:
                     time.time() - t_admet,
                 )
 
+
                 self._step_skip(3, "Skipped — toxicity report mode")
                 self._step_skip(4, "Skipped — no docking in toxicity report mode")
                 self._step_skip(5, "Skipped — toxicity report mode")
                 self._step_skip(6, "Skipped — toxicity report mode")
 
+
                 surviving      = passed_admet
                 receptor_pdbqt = None
+
 
             else:
                 self._step_start(4)
@@ -261,6 +301,7 @@ class PipelineOrchestrator:
                     raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
                 else:
                     raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
+
 
                 if req.pipeline_steps.admet:
                     self._step_start(2)
@@ -272,6 +313,7 @@ class PipelineOrchestrator:
                     )
                     for smi, result in zip(surviving, admet_results):
                         compound_results[smi].admet = result
+
 
                     total_flags = sum(len(r.flags) for r in admet_results)
                     high_flags  = sum(
@@ -303,8 +345,10 @@ class PipelineOrchestrator:
                         time.time() - t_pdb,
                     )
 
+
                 if not surviving:
                     raise RuntimeError("No compounds survived the ADMET filter.")
+
 
                 # ── STEP 4: ML Binding Pre-filter ─────────────────────────────
                 t = time.time()
@@ -325,23 +369,25 @@ class PipelineOrchestrator:
                     self._step_skip(3)
                     surviving = surviving[:10]
 
+
                 if not surviving:
                     raise RuntimeError("No compounds survived the binding pre-filter.")
+
 
                 # ── STEP 5: Vina Docking ──────────────────────────────────────
                 t = time.time()
                 self._step_start(5)
                 if req.pipeline_steps.docking:
-                    # ← progress callback: fires after each compound is docked
                     def docking_progress(current: int, total: int):
                         self._update_step_progress(5, current, total)
+
 
                     passed_docking, docking_results, binding_site_info = await asyncio.to_thread(
                         dock_compounds,
                         surviving, receptor_pdbqt, self.job_id, raw_pdb_path,
                         req.binding_site_mode, req.docking_speed,
                         req.binding_site_coords, req.binding_site_residues,
-                        on_progress=docking_progress,   # ← NEW
+                        on_progress=docking_progress,
                     )
                     for smi, result in zip(surviving, docking_results):
                         compound_results[smi].docking = result
@@ -353,6 +399,7 @@ class PipelineOrchestrator:
                     surviving = passed_docking if passed_docking else surviving[:3]
                 else:
                     self._step_skip(5)
+
 
                 # ── STEP 6: Retrosynthesis ────────────────────────────────────
                 t = time.time()
@@ -370,17 +417,24 @@ class PipelineOrchestrator:
                 else:
                     self._step_skip(6)
 
+
             # ── STEP 7: Scoring & Ranking (always runs) ───────────────────────
             t = time.time()
             self._step_start(7)
-            ranked = score_and_rank(list(compound_results.values()))
+            ranked = score_and_rank(                        # ← FIX
+                list(compound_results.values()),
+                pipeline_steps=req.pipeline_steps,          # ← FIX: pass steps so scorer
+            )                                               #         can hard-zero undocked
             self._step_done(7, f"Ranked {len(ranked)} compounds", time.time() - t)
+
 
             self._write_results(ranked, canonical_smiles, len(analogues), binding_site_info)
             self._write_status("done")
 
+
             if not req.toxicity_report_only and req.pipeline_steps.docking:
                 cleanup_docking_files(self.job_id)
+
 
         except Exception as e:
             print(f"[Orchestrator] Job {self.job_id} failed: {e}")
@@ -392,7 +446,9 @@ class PipelineOrchestrator:
             self._write_status("failed", error=str(e))
             raise
 
+
     # ── Results writer ────────────────────────────────────────────────────────
+
 
     def _write_results(
         self,
@@ -406,6 +462,7 @@ class PipelineOrchestrator:
                 1 for c in ranked
                 if getattr(c, attr) and getattr(getattr(c, attr), "passed", False)
             )
+
 
         results = JobResultsResponse(
             job_id                    = self.job_id,

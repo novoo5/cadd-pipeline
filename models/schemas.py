@@ -5,7 +5,9 @@ from datetime import datetime
 
 
 
+
 # ── Enums ─────────────────────────────────────────────────────────────────────
+
 
 
 class PipelineSteps(BaseModel):
@@ -17,10 +19,12 @@ class PipelineSteps(BaseModel):
 
 
 
+
 class BindingSiteMode(str, Enum):
     auto        = "auto"
     coordinates = "coordinates"
     residues    = "residues"
+
 
 
 
@@ -31,6 +35,7 @@ class DockingSpeed(str, Enum):
 
 
 
+
 class SolubilityFilterMode(str, Enum):
     soluble_only   = "soluble_only"
     allow_slightly = "allow_slightly"
@@ -38,7 +43,9 @@ class SolubilityFilterMode(str, Enum):
 
 
 
+
 # ── Sub-models ────────────────────────────────────────────────────────────────
+
 
 
 class BindingSiteCoords(BaseModel):
@@ -49,10 +56,12 @@ class BindingSiteCoords(BaseModel):
 
 
 
+
 class BindingSiteResidues(BaseModel):
     chain:         str
     residue_start: int
     residue_end:   int
+
 
 
 
@@ -66,7 +75,9 @@ class BindingSiteInfo(BaseModel):
 
 
 
+
 # ── Job request ───────────────────────────────────────────────────────────────
+
 
 
 class JobRequest(BaseModel):
@@ -74,13 +85,15 @@ class JobRequest(BaseModel):
     pdb_id:      Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC)")
     pdb_content: Optional[str] = Field(None, description="Raw .pdb file content as string")
 
-    # ← was le=1000
+
     num_analogues: int = Field(25, ge=0, le=10000)
+
 
     direct_score_only: bool = Field(
         False,
         description="Skip analogue generation; score the input compound directly",
     )
+
 
     solubility_filter: SolubilityFilterMode = Field(
         SolubilityFilterMode.all,
@@ -89,6 +102,7 @@ class JobRequest(BaseModel):
             "'soluble_only' = logS > -3, 'allow_slightly' = logS > -5, 'all' = no filter."
         ),
     )
+
 
     toxicity_report_only: bool = Field(
         False,
@@ -99,14 +113,17 @@ class JobRequest(BaseModel):
         ),
     )
 
+
     pipeline_steps:        PipelineSteps                = Field(default_factory=PipelineSteps)
     binding_site_mode:     BindingSiteMode               = BindingSiteMode.auto
     binding_site_coords:   Optional[BindingSiteCoords]   = None
     binding_site_residues: Optional[BindingSiteResidues] = None
     docking_speed:         DockingSpeed                  = DockingSpeed.balanced
 
+
     mw_min: float = Field(200.0, ge=0, description="Min MW for drug-likeness filter (Da)")
     mw_max: float = Field(500.0, ge=0, description="Max MW for drug-likeness filter (Da)")
+
 
     max_lipinski_violations: Optional[int] = Field(
         1,
@@ -114,6 +131,15 @@ class JobRequest(BaseModel):
         ge=1,
         le=3,
     )
+
+    locked_scaffold_smarts: Optional[str] = Field(          # ← NEW
+        None,
+        description=(
+            "SMARTS pattern that every generated analogue must contain as a substructure. "
+            "None = no scaffold lock. Invalid SMARTS = lock silently disabled with a warning."
+        ),
+    )
+
 
     @field_validator("smiles")
     @classmethod
@@ -123,6 +149,7 @@ class JobRequest(BaseModel):
             raise ValueError("SMILES string cannot be empty")
         return v
 
+
     @field_validator("pdb_id")
     @classmethod
     def pdb_id_format(cls, v: Optional[str]) -> Optional[str]:
@@ -131,6 +158,7 @@ class JobRequest(BaseModel):
             if len(v) != 4 or not v.isalnum():
                 raise ValueError("PDB ID must be exactly 4 alphanumeric characters")
         return v
+
 
     @model_validator(mode="after")
     def cross_field_checks(self) -> "JobRequest":
@@ -153,7 +181,9 @@ class JobRequest(BaseModel):
 
 
 
+
 # ── Status / steps ────────────────────────────────────────────────────────────
+
 
 
 class StepStatus(str, Enum):
@@ -165,13 +195,15 @@ class StepStatus(str, Enum):
 
 
 
+
 class PipelineStepInfo(BaseModel):
     name:             str
     status:           StepStatus     = StepStatus.waiting
     message:          Optional[str]  = None
     duration_seconds: Optional[float] = None
-    progress_current: Optional[int]  = None   # ← NEW: e.g. 47
-    progress_total:   Optional[int]  = None   # ← NEW: e.g. 100
+    progress_current: Optional[int]  = None
+    progress_total:   Optional[int]  = None
+
 
 
 
@@ -185,7 +217,9 @@ class JobStatusResponse(BaseModel):
 
 
 
+
 # ── Pipeline step results ─────────────────────────────────────────────────────
+
 
 
 class LipinskiResult(BaseModel):
@@ -199,6 +233,7 @@ class LipinskiResult(BaseModel):
 
 
 
+
 class ADMETFlagDetail(BaseModel):
     property_name:  str
     value:          float
@@ -207,6 +242,7 @@ class ADMETFlagDetail(BaseModel):
     severity:       str
     implication:    str
     recommendation: str
+
 
 
 
@@ -222,10 +258,12 @@ class ADMETResult(BaseModel):
 
 
 
+
 class BindingPrefilterResult(BaseModel):
     passed:                  bool
     predicted_affinity_kcal: float
     confidence:              float
+
 
 
 
@@ -237,11 +275,13 @@ class DockingPose(BaseModel):
 
 
 
+
 class DockingResult(BaseModel):
     passed:             bool
     best_affinity_kcal: float
     cnn_score:          float
     poses:              List[DockingPose]
+
 
 
 
@@ -253,11 +293,13 @@ class RetrosynthesisStep(BaseModel):
 
 
 
+
 class RetrosynthesisResult(BaseModel):
     feasible:         bool
     num_steps:        int
     route:            List[RetrosynthesisStep]
     complexity_score: float
+
 
 
 
@@ -274,7 +316,9 @@ class CompoundResult(BaseModel):
 
 
 
+
 # ── Job responses ─────────────────────────────────────────────────────────────
+
 
 
 class JobResultsResponse(BaseModel):
@@ -289,6 +333,7 @@ class JobResultsResponse(BaseModel):
     binding_site_info:         Optional[BindingSiteInfo] = None
     created_at:                datetime
     completed_at:              datetime
+
 
 
 
