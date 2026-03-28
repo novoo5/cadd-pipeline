@@ -103,10 +103,9 @@ class JobRequest(BaseModel):
     toxicity_report_only: bool = Field(
         False,
         description=(
-            "Force ADMET toxicity analysis to run. When combined with direct_score_only, "
-            "runs the full pipeline on the base compound with ADMET guaranteed. "
-            "When used alone (without direct_score_only), skips docking/retrosynthesis — "
-            "pdb_id / pdb_content are NOT required in that case."
+            "Force ADMET toxicity analysis to run and use the ADMET-only shortcut path. "
+            "PDB / docking are NEVER required when this is True, even combined with "
+            "direct_score_only. Results are always written even if 0 compounds pass ADMET."
         ),
     )
 
@@ -153,19 +152,17 @@ class JobRequest(BaseModel):
 
     @model_validator(mode="after")
     def cross_field_checks(self) -> "JobRequest":
-        both_modes = self.toxicity_report_only and self.direct_score_only
-
-        # PDB required when docking is on, UNLESS it's pure tox-only mode
-        # (both_modes = full pipeline on single compound, so PDB still needed for docking)
+        # PDB is NEVER required when toxicity_report_only=True —
+        # orchestrator always takes the ADMET-only shortcut in that case,
+        # regardless of whether direct_score_only is also set.
         needs_pdb = (
-            (not self.toxicity_report_only or both_modes)
+            not self.toxicity_report_only
             and self.pipeline_steps.docking
         )
         if needs_pdb and self.pdb_id is None and self.pdb_content is None:
             raise ValueError(
                 "Either pdb_id or pdb_content must be provided "
-                "(not required when toxicity_report_only=True without direct_score_only, "
-                "or when docking is disabled)"
+                "(not required when toxicity_report_only=True or docking is disabled)"
             )
         if self.binding_site_mode == BindingSiteMode.coordinates and self.binding_site_coords is None:
             raise ValueError("binding_site_coords required when mode is 'coordinates'")

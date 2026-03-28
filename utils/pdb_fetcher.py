@@ -17,6 +17,12 @@ async def fetch_pdb_by_id(pdb_id: str, job_id: str) -> str:
     Returns the saved file path as a string.
     Raises ValueError if PDB ID not found.
     """
+    if not pdb_id or not pdb_id.strip():
+        raise ValueError(
+            "fetch_pdb_by_id called with empty pdb_id — "
+            "this should not happen when toxicity_report_only=True."
+        )
+
     pdb_id = pdb_id.strip().upper()
     url = RCSB_PDB_DOWNLOAD_URL.format(pdb_id=pdb_id)
 
@@ -98,11 +104,22 @@ async def fetch_pdb_metadata(pdb_id: str) -> dict:
         return {}
 
 
-def save_pdb_from_content(pdb_content: str, job_id: str) -> str:
+def save_pdb_from_content(pdb_content: Optional[str], job_id: str) -> str:
     """
     Saves raw .pdb content (from frontend file upload) to disk.
     Returns the saved file path as a string.
     """
+    # Guard: pdb_content is None when no file was uploaded and no pdb_id was given.
+    # This should never be called in toxicity_report_only mode — but defensive check here.
+    if pdb_content is None:
+        raise ValueError(
+            "save_pdb_from_content called with pdb_content=None — "
+            "no PDB file was uploaded. "
+            "If you are running toxicity_report_only=True, the orchestrator "
+            "should not be calling this function at all. "
+            "Check that tox_mode routing in orchestrator.py is correct."
+        )
+
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     save_path = job_dir / "receptor_raw.pdb"

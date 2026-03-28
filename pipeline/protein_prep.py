@@ -1,7 +1,7 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional
 
 
 try:
@@ -16,6 +16,14 @@ JOBS_DIR = Path("storage/jobs")
 
 
 def prepare_receptor(pdb_path: str, job_id: str) -> str:
+    # Guard: should never be called with None in tox_mode — defensive check
+    if pdb_path is None:
+        raise ValueError(
+            "prepare_receptor called with pdb_path=None — "
+            "this means the orchestrator reached protein prep without a PDB source. "
+            "Check that toxicity_report_only=True is routing to the tox shortcut."
+        )
+
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -35,6 +43,9 @@ def prepare_receptor(pdb_path: str, job_id: str) -> str:
 def prepare_ligand(smiles: str, job_id: str, compound_index: int) -> str:
     from rdkit import Chem
     from rdkit.Chem import AllChem
+
+    if not smiles or not smiles.strip():
+        raise ValueError("prepare_ligand called with empty SMILES")
 
     job_dir = JOBS_DIR / job_id / "ligands"
     job_dir.mkdir(parents=True, exist_ok=True)

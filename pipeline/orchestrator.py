@@ -111,10 +111,12 @@ class PipelineOrchestrator:
 
         locked_scaffold = getattr(req, "locked_scaffold_smarts", None) or None
 
-        # True when user wants single-compound full pipeline + ADMET together
-        both_modes = req.toxicity_report_only and req.direct_score_only
-        # True when user wants ADMET-only shortcut (no docking)
-        tox_only   = req.toxicity_report_only and not req.direct_score_only
+        # ── Routing flags ─────────────────────────────────────────────────────
+        # tox_mode  : ADMET-only shortcut (no docking) — triggered by toxicity_report_only
+        #             regardless of direct_score_only. PDB never needed.
+        # direct_only: full pipeline on a single compound (no analogue gen), PDB needed.
+        tox_mode    = req.toxicity_report_only
+        direct_only = req.direct_score_only and not req.toxicity_report_only
 
 
         try:
@@ -130,9 +132,19 @@ class PipelineOrchestrator:
             def analogue_progress(current: int, total: int):
                 self._update_step_progress(0, current, total)
 
-            if tox_only:
-                # Pure ADMET-only mode — no docking, PDB not required
-                if req.num_analogues > 0:
+            if tox_mode:
+                # Covers both pure tox-only AND direct_score + toxicity_report together.
+                # In both cases: ADMET shortcut, no docking, no PDB needed.
+                if req.direct_score_only:
+                    # both_modes: single compound, no analogues
+                    analogues = [canonical_smiles]
+                    self._step_done(
+                        0,
+                        "Direct Score + Toxicity Report — base compound only queued for ADMET (no analogues)",
+                        time.time() - t,
+                    )
+                elif req.num_analogues > 0:
+                    # pure tox with analogues
                     analogues = await asyncio.to_thread(
                         generate_analogues,
                         canonical_smiles,
@@ -157,6 +169,7 @@ class PipelineOrchestrator:
                         time.time() - t,
                     )
                 else:
+                    # pure tox, base compound only
                     analogues = [canonical_smiles]
                     self._step_done(
                         0,
@@ -164,19 +177,16 @@ class PipelineOrchestrator:
                         time.time() - t,
                     )
 
-            elif req.direct_score_only:
-                # Direct score mode (with or without toxicity_report_only)
-                # both_modes also lands here — single compound, full pipeline + ADMET
+            elif direct_only:
                 analogues = [canonical_smiles]
-                mode_label = (
-                    "Direct scoring + Toxicity Report — full pipeline on base compound (ADMET guaranteed)"
-                    if both_modes
-                    else "Direct scoring mode — input compound scored as-is (no analogues generated)"
+                self._step_done(
+                    0,
+                    "Direct scoring mode — input compound scored as-is (no analogues generated)",
+                    time.time() - t,
                 )
-                self._step_done(0, mode_label, time.time() - t)
 
             else:
-                # Normal analogue generation mode
+                # Normal analogue generation
                 analogues = await asyncio.to_thread(
                     generate_analogues,
                     canonical_smiles,
@@ -208,8 +218,7 @@ class PipelineOrchestrator:
             t = time.time()
             self._step_start(1)
 
-            if tox_only:
-                # Pure tox mode skips Lipinski — screen everything
+            if tox_mode:
                 self._step_skip(1, "Skipped — toxicity report mode screens all compounds")
                 surviving = analogues
 
@@ -249,15 +258,15 @@ class PipelineOrchestrator:
                 self._step_skip(1)
                 surviving = analogues
 
-            if not surviving:
+            if not surviving and not tox_mode:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
 
 
             # ── STEP 3: ADMET ─────────────────────────────────────────────────
             t_pdb = time.time()
 
-            if tox_only:
-                # ── Pure ADMET-only shortcut ──────────────────────────────────
+            if tox_mode:
+                # ── Tox shortcut (covers pure-tox AND direct+tox) ─────────────
                 self._step_start(2)
                 t_admet = time.time()
                 passed_admet, admet_results = await asyncio.to_thread(
@@ -285,19 +294,19 @@ class PipelineOrchestrator:
                 self._step_skip(5, "Skipped — toxicity report mode")
                 self._step_skip(6, "Skipped — toxicity report mode")
 
-                surviving      = passed_admet
+                # ── FIX: never raise here — write results even if 0 passed ADMET
+                # The full toxicity profile is still in compound_results for all compounds.
+                surviving      = passed_admet   # may be empty — that's fine
                 receptor_pdbqt = None
 
             else:
-                # ── Full pipeline (covers normal, direct_score_only, both_modes) ─
+                # ── Full pipeline (normal or direct_only) ─────────────────────
                 self._step_start(4)
                 if req.pdb_id:
                     raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
                 else:
                     raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
 
-                # ADMET is forced True by schema when toxicity_report_only is set,
-                # so both_modes always enters this branch
                 if req.pipeline_steps.admet:
                     self._step_start(2)
                     t_admet       = time.time()
@@ -421,7 +430,7 @@ class PipelineOrchestrator:
             self._write_results(ranked, canonical_smiles, len(analogues), binding_site_info)
             self._write_status("done")
 
-            if not tox_only and req.pipeline_steps.docking:
+            if not tox_mode and req.pipeline_steps.docking:
                 cleanup_docking_files(self.job_id)
 
 
