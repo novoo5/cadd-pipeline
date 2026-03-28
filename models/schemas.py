@@ -85,15 +85,12 @@ class JobRequest(BaseModel):
     pdb_id:      Optional[str] = Field(None, description="RCSB PDB ID (e.g. 1ABC)")
     pdb_content: Optional[str] = Field(None, description="Raw .pdb file content as string")
 
-
     num_analogues: int = Field(25, ge=0, le=10000)
-
 
     direct_score_only: bool = Field(
         False,
         description="Skip analogue generation; score the input compound directly",
     )
-
 
     solubility_filter: SolubilityFilterMode = Field(
         SolubilityFilterMode.all,
@@ -103,16 +100,15 @@ class JobRequest(BaseModel):
         ),
     )
 
-
     toxicity_report_only: bool = Field(
         False,
         description=(
-            "Run only ADMET toxicity analysis. Skips analogue gen (unless "
-            "num_analogues > 0), drug-likeness, docking, and retrosynthesis. "
-            "pdb_id / pdb_content are NOT required when this is True."
+            "Force ADMET toxicity analysis to run. When combined with direct_score_only, "
+            "runs the full pipeline on the base compound with ADMET guaranteed. "
+            "When used alone (without direct_score_only), skips docking/retrosynthesis — "
+            "pdb_id / pdb_content are NOT required in that case."
         ),
     )
-
 
     pipeline_steps:        PipelineSteps                = Field(default_factory=PipelineSteps)
     binding_site_mode:     BindingSiteMode               = BindingSiteMode.auto
@@ -120,10 +116,8 @@ class JobRequest(BaseModel):
     binding_site_residues: Optional[BindingSiteResidues] = None
     docking_speed:         DockingSpeed                  = DockingSpeed.balanced
 
-
     mw_min: float = Field(200.0, ge=0, description="Min MW for drug-likeness filter (Da)")
     mw_max: float = Field(500.0, ge=0, description="Max MW for drug-likeness filter (Da)")
-
 
     max_lipinski_violations: Optional[int] = Field(
         1,
@@ -132,14 +126,13 @@ class JobRequest(BaseModel):
         le=3,
     )
 
-    locked_scaffold_smarts: Optional[str] = Field(          # ← NEW
+    locked_scaffold_smarts: Optional[str] = Field(
         None,
         description=(
             "SMARTS pattern that every generated analogue must contain as a substructure. "
             "None = no scaffold lock. Invalid SMARTS = lock silently disabled with a warning."
         ),
     )
-
 
     @field_validator("smiles")
     @classmethod
@@ -148,7 +141,6 @@ class JobRequest(BaseModel):
         if not v:
             raise ValueError("SMILES string cannot be empty")
         return v
-
 
     @field_validator("pdb_id")
     @classmethod
@@ -159,17 +151,21 @@ class JobRequest(BaseModel):
                 raise ValueError("PDB ID must be exactly 4 alphanumeric characters")
         return v
 
-
     @model_validator(mode="after")
     def cross_field_checks(self) -> "JobRequest":
+        both_modes = self.toxicity_report_only and self.direct_score_only
+
+        # PDB required when docking is on, UNLESS it's pure tox-only mode
+        # (both_modes = full pipeline on single compound, so PDB still needed for docking)
         needs_pdb = (
-            not self.toxicity_report_only
+            (not self.toxicity_report_only or both_modes)
             and self.pipeline_steps.docking
         )
         if needs_pdb and self.pdb_id is None and self.pdb_content is None:
             raise ValueError(
                 "Either pdb_id or pdb_content must be provided "
-                "(not required when toxicity_report_only=True or docking is disabled)"
+                "(not required when toxicity_report_only=True without direct_score_only, "
+                "or when docking is disabled)"
             )
         if self.binding_site_mode == BindingSiteMode.coordinates and self.binding_site_coords is None:
             raise ValueError("binding_site_coords required when mode is 'coordinates'")
@@ -177,6 +173,12 @@ class JobRequest(BaseModel):
             raise ValueError("binding_site_residues required when mode is 'residues'")
         if self.direct_score_only:
             object.__setattr__(self, "num_analogues", 0)
+
+        # Always force ADMET on when toxicity_report_only is set
+        if self.toxicity_report_only:
+            updated_steps = self.pipeline_steps.model_copy(update={"admet": True})
+            object.__setattr__(self, "pipeline_steps", updated_steps)
+
         return self
 
 
@@ -198,11 +200,11 @@ class StepStatus(str, Enum):
 
 class PipelineStepInfo(BaseModel):
     name:             str
-    status:           StepStatus     = StepStatus.waiting
-    message:          Optional[str]  = None
+    status:           StepStatus      = StepStatus.waiting
+    message:          Optional[str]   = None
     duration_seconds: Optional[float] = None
-    progress_current: Optional[int]  = None
-    progress_total:   Optional[int]  = None
+    progress_current: Optional[int]   = None
+    progress_total:   Optional[int]   = None
 
 
 
