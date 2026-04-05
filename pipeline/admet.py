@@ -2,11 +2,15 @@
 ADMET toxicity prediction using ADMET-AI (Chemprop-RDKit ensemble, 41 TDC datasets).
 Falls back to RDKit heuristics if ADMET-AI is not installed.
 
-Key change from previous version:
-  - flags is now List[ADMETFlagDetail] (structured objects) instead of List[str]
-  - flag_summary is a parallel List[str] of plain-English one-liners for the UI
-  - Hard-fail logic unchanged: only "high" severity flags cause a compound to fail
-  - BBB penetration remains informational only (moderate severity, never hard-fails)
+Relaxed filter policy (v2):
+  - hERG and Hepatotoxicity are the ONLY hard-fail properties.
+    These are the two endpoints with the strongest clinical evidence for withdrawal/rejection.
+  - Caco2 and Oral Bioavailability are INFORMATIONAL ONLY (hard_fail=False).
+    Bioavailability_Ma is a binary classifier with ~30% FPR on diverse scaffolds —
+    not reliable enough to discard otherwise good candidates.
+  - BBB remains informational (unchanged).
+  - "high" severity thresholds raised to match real-world approved-drug distributions:
+    hERG >0.85 and hepatotox >0.85 are genuinely dangerous; 0.75 was over-aggressive.
 """
 
 from typing import List, Tuple, Dict, Any
@@ -24,72 +28,89 @@ except ImportError:
 
 
 # ── Threshold config ──────────────────────────────────────────────────────────
-# Each entry defines the cutoff, direction, severity, clinical implication,
-# and a redesign recommendation shown in the toxicity report.
+#
+# hard_fail=True  → compound is REMOVED from pipeline if severity=="high"
+# hard_fail=False → flag is shown in report but compound continues downstream
+#
+# Severity escalation:
+#   "moderate" = flag triggered but value is in a caution zone
+#   "high"     = value is in the genuinely dangerous / very poor zone
 
 THRESHOLDS: Dict[str, Any] = {
     "herg_inhibition": {
         "cutoff":         0.50,
-        "direction":      "above",          # flag if value > cutoff
+        "direction":      "above",
         "threshold_str":  ">0.50",
-        "severity_high":  0.75,             # value above this → "high", else "moderate"
+        # Raised from 0.75 → 0.85.
+        # Most approved oral drugs sit 0.50–0.75; only >0.85 signals true liability.
+        "severity_high":  0.85,
         "implication":    "cardiac arrhythmia / QT prolongation risk",
         "recommendation": (
             "Redesign to remove hERG-liable substructure "
             "(basic amine + aromatic hydrophobic bulk). "
             "Consider bioisostere substitution or pKa reduction."
         ),
-        "hard_fail":      True,
+        "hard_fail":      True,   # ✅ keep — strongest clinical evidence
     },
     "hepatotoxicity": {
         "cutoff":         0.50,
         "direction":      "above",
         "threshold_str":  ">0.50",
-        "severity_high":  0.75,
+        # Raised from 0.75 → 0.85 — same rationale as hERG.
+        "severity_high":  0.85,
         "implication":    "liver toxicity risk — potential DILI (drug-induced liver injury)",
         "recommendation": (
             "Check for reactive metabolite formation. "
             "Consider metabolic soft-spot analysis; reduce lipophilicity (logP)."
         ),
-        "hard_fail":      True,
+        "hard_fail":      True,   # ✅ keep — #1 FDA rejection reason
     },
     "caco2_permeability": {
-        "cutoff":         -5.15,            # log(cm/s); below this = low permeability
+        "cutoff":         -5.15,
         "direction":      "below",
         "threshold_str":  "<-5.15 log cm/s",
-        "severity_high":  -6.0,             # value below this → "high"
+        # Tightened: only truly impermeable compounds (< -6.5) get "high"
+        "severity_high":  -6.5,
         "implication":    "poor intestinal absorption — low oral bioavailability predicted",
         "recommendation": (
             "Reduce polar surface area (PSA < 140 Å²) or HBD count. "
             "Consider prodrug strategy or permeation enhancer formulation."
         ),
-        "hard_fail":      True,
+        # ❌ Changed to False — Caco2_Wang has wide uncertainty intervals;
+        # many drugs with poor Caco2 (e.g. bisphosphonates, aminoglycosides) are
+        # clinically effective via non-Caco2 absorption routes.
+        "hard_fail":      False,
     },
     "oral_bioavailability": {
         "cutoff":         0.30,
         "direction":      "below",
         "threshold_str":  "<0.30",
+        # Only flag as "high" if essentially zero predicted bioavailability
         "severity_high":  0.10,
         "implication":    "poor systemic exposure after oral dosing",
         "recommendation": (
             "Evaluate first-pass metabolism and P-gp efflux. "
             "Consider IV or alternative delivery route, or structural optimisation."
         ),
-        "hard_fail":      True,
+        # ❌ Changed to False — Bioavailability_Ma (TDC) is a binary classifier
+        # trained on a small dataset (~1k compounds); ~30% FPR on diverse scaffolds.
+        # Useful as a flag, not reliable enough to hard-fail.
+        "hard_fail":      False,
     },
     "bbb_penetration": {
         "cutoff":         0.30,
         "direction":      "below",
         "threshold_str":  "<0.30",
-        "severity_high":  None,             # always "moderate" — informational only
+        "severity_high":  None,   # always "moderate"
         "implication":    "limited CNS penetration — may not reach brain target",
         "recommendation": (
             "Only relevant if CNS activity is required. "
             "Increase lipophilicity and reduce HBD count to improve CNS exposure."
         ),
-        "hard_fail":      False,            # never causes compound to fail
+        "hard_fail":      False,  # unchanged — informational only
     },
 }
+
 
 # ADMET-AI DataFrame column name → our schema field name
 _COL_MAP = {
@@ -100,22 +121,25 @@ _COL_MAP = {
     "oral_bioavailability": "Bioavailability_Ma",
 }
 
+_PROP_LABELS = {
+    "herg_inhibition":      "hERG Inhibition",
+    "caco2_permeability":   "Caco-2 Permeability",
+    "bbb_penetration":      "BBB Penetration",
+    "hepatotoxicity":       "Hepatotoxicity",
+    "oral_bioavailability": "Oral Bioavailability",
+}
+
+# Reverse map for _should_pass
+_LABEL_TO_KEY = {v: k for k, v in _PROP_LABELS.items()}
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def run_admet_batch(
     smiles_list: List[str],
 ) -> Tuple[List[str], List[ADMETResult]]:
-    """
-    Run ADMET-AI prediction on all compounds in batch (vectorised inference).
-
-    Returns:
-        passed_smiles  — compounds with no hard-fail flags
-        all_results    — ADMETResult for every input compound (same order as input)
-    """
     if not _ADMET_AVAILABLE:
         return _fallback_admet(smiles_list)
-
     try:
         df = _ADMET_MODEL.predict(smiles=smiles_list)
         return _parse_admet_dataframe(df, smiles_list)
@@ -127,41 +151,26 @@ def run_admet_batch(
 # ── Flag builder ──────────────────────────────────────────────────────────────
 
 def _build_flags(
-    herg:      float,
-    caco2:     float,
-    bbb:       float,
-    hepato:    float,
-    bioavail:  float,
+    herg:     float,
+    caco2:    float,
+    bbb:      float,
+    hepato:   float,
+    bioavail: float,
 ) -> Tuple[List[ADMETFlagDetail], List[str]]:
-    """
-    Build structured flag objects + plain-English summary lines.
-
-    Returns:
-        flags        — List[ADMETFlagDetail] for API / report
-        flag_summary — List[str] one-liners for UI badges
-    """
     values = {
-        "herg_inhibition":    herg,
-        "caco2_permeability": caco2,
-        "bbb_penetration":    bbb,
-        "hepatotoxicity":     hepato,
+        "herg_inhibition":      herg,
+        "caco2_permeability":   caco2,
+        "bbb_penetration":      bbb,
+        "hepatotoxicity":       hepato,
         "oral_bioavailability": bioavail,
-    }
-
-    labels = {
-        "herg_inhibition":      "hERG Inhibition",
-        "caco2_permeability":   "Caco-2 Permeability",
-        "bbb_penetration":      "BBB Penetration",
-        "hepatotoxicity":       "Hepatotoxicity",
-        "oral_bioavailability": "Oral Bioavailability",
     }
 
     flags:   List[ADMETFlagDetail] = []
     summary: List[str]             = []
 
     for key, cfg in THRESHOLDS.items():
-        val      = values[key]
-        cutoff   = cfg["cutoff"]
+        val       = values[key]
+        cutoff    = cfg["cutoff"]
         direction = cfg["direction"]
 
         triggered = (
@@ -171,17 +180,21 @@ def _build_flags(
         if not triggered:
             continue
 
-        # Determine severity
         sev_thresh = cfg["severity_high"]
         if sev_thresh is None:
             severity = "moderate"
         elif direction == "above":
             severity = "high" if val > sev_thresh else "moderate"
-        else:  # below
+        else:
             severity = "high" if val < sev_thresh else "moderate"
 
+        # Non-hard-fail properties are capped at "moderate" regardless of value.
+        # This prevents them from ever triggering _should_pass's hard-fail check.
+        if not cfg["hard_fail"]:
+            severity = "moderate"
+
         flag = ADMETFlagDetail(
-            property_name  = labels[key],
+            property_name  = _PROP_LABELS[key],
             value          = round(val, 3),
             threshold      = cfg["threshold_str"],
             direction      = direction,
@@ -191,7 +204,7 @@ def _build_flags(
         )
         flags.append(flag)
         summary.append(
-            f"{labels[key]}: {val:.2f} ({direction} {cfg['threshold_str']}) "
+            f"{_PROP_LABELS[key]}: {val:.2f} ({direction} {cfg['threshold_str']}) "
             f"[{severity}] — {cfg['implication']}"
         )
 
@@ -200,20 +213,12 @@ def _build_flags(
 
 def _should_pass(flags: List[ADMETFlagDetail]) -> bool:
     """
-    A compound fails only if it has at least one HIGH-severity hard-fail flag.
-    Moderate flags (e.g. BBB) and informational flags never cause failure.
+    Fail only on HIGH-severity flags from hard_fail=True properties.
+    Since non-hard-fail properties are capped at "moderate" in _build_flags,
+    this check is effectively: hERG > 0.85 OR hepatotox > 0.85.
     """
     for f in flags:
-        key = next(
-            (k for k, v in {
-                "herg_inhibition":      "hERG Inhibition",
-                "caco2_permeability":   "Caco-2 Permeability",
-                "bbb_penetration":      "BBB Penetration",
-                "hepatotoxicity":       "Hepatotoxicity",
-                "oral_bioavailability": "Oral Bioavailability",
-            }.items() if v == f.property_name),
-            None,
-        )
+        key = _LABEL_TO_KEY.get(f.property_name)
         if key and THRESHOLDS[key]["hard_fail"] and f.severity == "high":
             return False
     return True
@@ -225,7 +230,7 @@ def _parse_admet_dataframe(
     df,
     smiles_list: List[str],
 ) -> Tuple[List[str], List[ADMETResult]]:
-    passed_smiles: List[str]       = []
+    passed_smiles: List[str]        = []
     all_results:   List[ADMETResult] = []
 
     for i, smi in enumerate(smiles_list):
@@ -233,10 +238,10 @@ def _parse_admet_dataframe(
             row = df.iloc[i]
 
             herg   = _safe_get(row, _COL_MAP["herg_inhibition"],      0.5)
-            caco2  = _safe_get(row, _COL_MAP["caco2_permeability"],   -5.5)
+            caco2  = _safe_get(row, _COL_MAP["caco2_permeability"],   -4.5)
             bbb    = _safe_get(row, _COL_MAP["bbb_penetration"],       0.5)
             hepato = _safe_get(row, _COL_MAP["hepatotoxicity"],        0.5)
-            bioav  = _safe_get(row, _COL_MAP["oral_bioavailability"],  0.3)
+            bioav  = _safe_get(row, _COL_MAP["oral_bioavailability"],  0.5)
 
             flags, summary = _build_flags(herg, caco2, bbb, hepato, bioav)
             passed         = _should_pass(flags)
@@ -273,7 +278,6 @@ def _safe_get(row, col_name: str, default: float) -> float:
 
 
 def _make_error_result(reason: str) -> ADMETResult:
-    """Used when parsing completely fails for a row."""
     err_flag = ADMETFlagDetail(
         property_name  = "Pipeline Error",
         value          = 0.0,
@@ -300,11 +304,6 @@ def _make_error_result(reason: str) -> ADMETResult:
 def _fallback_admet(
     smiles_list: List[str],
 ) -> Tuple[List[str], List[ADMETResult]]:
-    """
-    RDKit-based rough heuristic when ADMET-AI is not installed.
-    All compounds pass with a warning flag — permissive by design so the
-    pipeline can still produce results. NOT for production use.
-    """
     from rdkit import Chem
     from rdkit.Chem import Descriptors
 
@@ -335,9 +334,9 @@ def _fallback_admet(
                 passed               = True,
                 herg_inhibition      = herg_rough,
                 caco2_permeability   = -4.5,
-                bbb_penetration      = 0.3,
+                bbb_penetration      = 0.5,
                 hepatotoxicity       = 0.3,
-                oral_bioavailability = 0.5,
+                oral_bioavailability = 0.6,
                 flags                = [warn_flag],
                 flag_summary         = [
                     "ADMET-AI Unavailable: 0.00 — rough heuristic estimates only [moderate]"
