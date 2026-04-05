@@ -1,8 +1,20 @@
+"""
+Molecular docking via AutoDock Vina.
+
+New in this version (download feature):
+  - _dock_single() now accepts raw_pdb_path and generates two extra files after docking:
+      best_pose_{idx}_H.pdb           — Pose 1 only, with hydrogens added (obabel)
+      complex_{idx}_PLIP_ready.pdb    — receptor ATOM records + docked ligand HETATM,
+                                        ready for PLIP / PyMOL without any CLI work
+  - cleanup_docking_files() now only removes the ligand preparation directory.
+    docking_outputs/ is intentionally preserved so users can download all three files.
+"""
+
 import re
 import subprocess
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Optional, Callable  # ← added Callable
+from typing import List, Tuple, Optional, Callable
 
 from backend.models.schemas import (
     DockingResult,
@@ -31,6 +43,8 @@ BOX_SIZE       = 25.0
 PASS_THRESHOLD = -5.0
 
 
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def dock_compounds(
     smiles_list:           List[str],
     receptor_pdbqt:        str,
@@ -40,7 +54,7 @@ def dock_compounds(
     docking_speed:         DockingSpeed,
     binding_site_coords:   Optional[BindingSiteCoords]   = None,
     binding_site_residues: Optional[BindingSiteResidues] = None,
-    on_progress:           Optional[Callable[[int, int], None]] = None,  # ← NEW
+    on_progress:           Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[List[str], List[DockingResult], BindingSiteInfo]:
 
     center, _, binding_site_info = get_binding_site_box(
@@ -52,7 +66,7 @@ def dock_compounds(
     cx, cy, cz = center
     exhaustiveness = EXHAUSTIVENESS_MAP[docking_speed]
 
-    passed_smiles: List[str]       = []
+    passed_smiles: List[str]        = []
     all_results:   List[DockingResult] = []
     total = len(smiles_list)
 
@@ -62,6 +76,7 @@ def dock_compounds(
             result = _dock_single(
                 smiles=smi,
                 receptor_pdbqt=receptor_pdbqt,
+                raw_pdb_path=raw_pdb_path,   # ← passed through for complex generation
                 job_id=job_id,
                 compound_index=idx,
                 cx=cx, cy=cy, cz=cz,
@@ -81,16 +96,18 @@ def dock_compounds(
                 poses=[],
             ))
 
-        # ← NEW: fire progress after every compound completes (pass or fail)
         if on_progress:
             on_progress(idx + 1, total)
 
     return passed_smiles, all_results, binding_site_info
 
 
+# ── Single-compound docking ───────────────────────────────────────────────────
+
 def _dock_single(
     smiles:          str,
     receptor_pdbqt:  str,
+    raw_pdb_path:    str,   # ← NEW: needed for complex PDB generation
     job_id:          str,
     compound_index:  int,
     cx:              float,
@@ -148,6 +165,16 @@ def _dock_single(
     best_affinity = poses[0].affinity_kcal
     print(f"[Docking] Best affinity: {best_affinity} kcal/mol")
 
+    # ── Post-docking: generate downloadable PDB files ────────────────────────
+    pose_pdb_path = out_dir / f"best_pose_{compound_index}_H.pdb"
+    _generate_pose_pdb(out_pdbqt, pose_pdb_path)
+    _generate_complex_pdb(
+        pose_pdb_path=pose_pdb_path,
+        receptor_pdb_path=raw_pdb_path,
+        out_path=out_dir / f"complex_{compound_index}_PLIP_ready.pdb",
+        compound_index=compound_index,
+    )
+
     return DockingResult(
         passed=best_affinity <= PASS_THRESHOLD,
         best_affinity_kcal=round(best_affinity, 4),
@@ -155,6 +182,93 @@ def _dock_single(
         poses=poses,
     )
 
+
+# ── Post-docking file generators ──────────────────────────────────────────────
+
+def _generate_pose_pdb(out_pdbqt: str, pose_pdb_path: Path) -> None:
+    """
+    Use obabel to extract pose 1 from out_{idx}.pdbqt and add hydrogens.
+    Output: best_pose_{idx}_H.pdb — ready for PLIP or PyMOL.
+    Silently skips if obabel is not installed or fails.
+    """
+    cmd = [
+        "obabel", out_pdbqt,
+        "-O", str(pose_pdb_path),
+        "-f", "1", "-l", "1",   # first MODEL block only
+        "-h",                    # add hydrogens
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print(f"[Docking] obabel pose→pdb warning: {result.stderr[:300]}")
+        else:
+            print(f"[Docking] Pose PDB written: {pose_pdb_path}")
+    except FileNotFoundError:
+        print("[Docking] obabel not found — skipping pose PDB generation.")
+    except subprocess.TimeoutExpired:
+        print(f"[Docking] obabel timed out for {pose_pdb_path.name}.")
+
+
+def _generate_complex_pdb(
+    pose_pdb_path:    Path,
+    receptor_pdb_path: str,
+    out_path:         Path,
+    compound_index:   int,
+) -> None:
+    """
+    Merge receptor + docked ligand into a single PDB file for PLIP.
+
+    Receptor handling:
+      - ATOM lines are always kept (protein backbone + sidechains).
+      - HETATM lines are kept only for single-element entries (structural ions
+        like Zn²⁺, Mg²⁺, Ca²⁺) — crystal ligands are stripped to avoid PLIP
+        confusion.
+      - END / CONECT / REMARK from the receptor are dropped.
+
+    Ligand handling:
+      - All ATOM/HETATM lines from the pose PDB are re-labelled as HETATM so
+        PLIP correctly identifies them as the bound ligand.
+      - CONECT records are preserved for bond topology.
+
+    Skips silently if pose_pdb_path does not exist (obabel unavailable).
+    """
+    if not pose_pdb_path.exists():
+        print(f"[Docking] Pose PDB missing — skipping complex generation for compound {compound_index}.")
+        return
+
+    try:
+        receptor_lines = Path(receptor_pdb_path).read_text(errors="ignore").splitlines()
+        pose_lines     = pose_pdb_path.read_text(errors="ignore").splitlines()
+
+        receptor_block: List[str] = []
+        for line in receptor_lines:
+            rec = line[:6].strip()
+            if rec == "ATOM":
+                receptor_block.append(line)
+            elif rec == "HETATM":
+                # Keep only single-atom HETATM (structural metal ions)
+                atom_name = line[12:16].strip()
+                if len(atom_name) <= 2:
+                    receptor_block.append(line)
+
+        ligand_block: List[str] = []
+        for line in pose_lines:
+            rec = line[:6].strip()
+            if rec in ("ATOM", "HETATM"):
+                # Force HETATM label so PLIP treats this as the ligand
+                ligand_block.append("HETATM" + line[6:])
+            elif rec == "CONECT":
+                ligand_block.append(line)
+
+        combined_lines = receptor_block + ["TER"] + ligand_block + ["END"]
+        out_path.write_text("\n".join(combined_lines) + "\n")
+        print(f"[Docking] Complex PDB written: {out_path}")
+
+    except Exception as e:
+        print(f"[Docking] Complex generation error for compound {compound_index}: {e}")
+
+
+# ── Vina stdout parser ────────────────────────────────────────────────────────
 
 def _parse_vina_output(stdout: str) -> List[DockingPose]:
     pattern = re.compile(
@@ -188,12 +302,21 @@ def _parse_vina_output(stdout: str) -> List[DockingPose]:
     return poses
 
 
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+
 def cleanup_docking_files(job_id: str) -> None:
+    """
+    Removes ligand *preparation* files only (input .pdbqt files generated
+    by prepare_ligand).
+
+    docking_outputs/ is intentionally preserved — it contains the three
+    downloadable files:
+        out_{idx}.pdbqt                 — raw Vina output
+        best_pose_{idx}_H.pdb           — best pose with hydrogens
+        complex_{idx}_PLIP_ready.pdb    — receptor + ligand complex
+    """
     import shutil
     ligand_dir = JOBS_DIR / job_id / "ligands"
     if ligand_dir.exists():
         shutil.rmtree(ligand_dir)
-    out_dir = JOBS_DIR / job_id / "docking_outputs"
-    if out_dir.exists():
-        for f in out_dir.glob("out_*.pdbqt"):
-            f.unlink(missing_ok=True)
+    # NOTE: docking_outputs/ is NOT cleaned — files are needed for user download.
