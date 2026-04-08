@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Callable
 
 
+
 from backend.models.schemas import (
     JobRequest, JobStatusResponse, JobResultsResponse,
     PipelineStepInfo, StepStatus, CompoundResult, BindingSiteInfo,
@@ -24,7 +25,9 @@ from backend.utils.pdb_fetcher import fetch_pdb_by_id, save_pdb_from_content
 from backend.utils.smiles_validator import validate_and_canonicalize
 
 
+
 JOBS_DIR = Path("storage/jobs")
+
 
 
 class PipelineOrchestrator:
@@ -38,7 +41,9 @@ class PipelineOrchestrator:
         self._init_steps()
 
 
+
     # ── Step initialisation ───────────────────────────────────────────────────
+
 
 
     def _init_steps(self):
@@ -57,7 +62,9 @@ class PipelineOrchestrator:
         self._write_status("queued")
 
 
+
     # ── Status helpers ────────────────────────────────────────────────────────
+
 
 
     def _write_status(self, status: str, error: Optional[str] = None):
@@ -69,9 +76,11 @@ class PipelineOrchestrator:
         (self.job_dir / "status.json").write_text(payload.model_dump_json(indent=2))
 
 
+
     def _step_start(self, index: int):
         self.steps[index].status = StepStatus.running
         self._write_status("running")
+
 
 
     def _step_done(self, index: int, message: str, elapsed: float):
@@ -83,10 +92,12 @@ class PipelineOrchestrator:
         self._write_status("running")
 
 
+
     def _step_skip(self, index: int, reason: str = "Disabled by user"):
         self.steps[index].status  = StepStatus.skipped
         self.steps[index].message = reason
         self._write_status("running")
+
 
 
     def _step_fail(self, index: int, error: str):
@@ -95,13 +106,16 @@ class PipelineOrchestrator:
         self._write_status("failed", error=error)
 
 
+
     def _update_step_progress(self, index: int, current: int, total: int):
         self.steps[index].progress_current = current
         self.steps[index].progress_total   = total
         self._write_status("running")
 
 
+
     # ── Main pipeline ─────────────────────────────────────────────────────────
+
 
 
     async def run(self):
@@ -109,14 +123,14 @@ class PipelineOrchestrator:
         compound_results:  dict[str, CompoundResult] = {}
         binding_site_info: Optional[BindingSiteInfo] = None
 
+
         locked_scaffold = getattr(req, "locked_scaffold_smarts", None) or None
 
+
         # ── Routing flags ─────────────────────────────────────────────────────
-        # tox_mode  : ADMET-only shortcut (no docking) — triggered by toxicity_report_only
-        #             regardless of direct_score_only. PDB never needed.
-        # direct_only: full pipeline on a single compound (no analogue gen), PDB needed.
         tox_mode    = req.toxicity_report_only
         direct_only = req.direct_score_only and not req.toxicity_report_only
+
 
 
         try:
@@ -125,18 +139,18 @@ class PipelineOrchestrator:
                 raise ValueError(f"Invalid SMILES: {err}")
 
 
+
             # ── STEP 1: Analogue Generation ───────────────────────────────────
             t = time.time()
             self._step_start(0)
 
+
             def analogue_progress(current: int, total: int):
                 self._update_step_progress(0, current, total)
 
+
             if tox_mode:
-                # Covers both pure tox-only AND direct_score + toxicity_report together.
-                # In both cases: ADMET shortcut, no docking, no PDB needed.
                 if req.direct_score_only:
-                    # both_modes: single compound, no analogues
                     analogues = [canonical_smiles]
                     self._step_done(
                         0,
@@ -144,7 +158,6 @@ class PipelineOrchestrator:
                         time.time() - t,
                     )
                 elif req.num_analogues > 0:
-                    # pure tox with analogues
                     analogues = await asyncio.to_thread(
                         generate_analogues,
                         canonical_smiles,
@@ -158,6 +171,7 @@ class PipelineOrchestrator:
                     if canonical_smiles not in analogues:
                         analogues = [canonical_smiles] + analogues
 
+
                     scaffold_note = " · scaffold locked" if locked_scaffold else ""
                     self._step_done(
                         0,
@@ -169,13 +183,13 @@ class PipelineOrchestrator:
                         time.time() - t,
                     )
                 else:
-                    # pure tox, base compound only
                     analogues = [canonical_smiles]
                     self._step_done(
                         0,
                         "Toxicity Report mode — base compound only (no analogues requested)",
                         time.time() - t,
                     )
+
 
             elif direct_only:
                 analogues = [canonical_smiles]
@@ -185,8 +199,8 @@ class PipelineOrchestrator:
                     time.time() - t,
                 )
 
+
             else:
-                # Normal analogue generation
                 analogues = await asyncio.to_thread(
                     generate_analogues,
                     canonical_smiles,
@@ -197,6 +211,7 @@ class PipelineOrchestrator:
                 )
                 if not analogues:
                     raise RuntimeError("Analogue generation produced 0 compounds.")
+
 
                 sol_note      = (
                     f" — solubility filter: {req.solubility_filter.value}"
@@ -210,17 +225,21 @@ class PipelineOrchestrator:
                     time.time() - t,
                 )
 
+
             for smi in analogues:
                 compound_results[smi] = CompoundResult(smiles=smi, canonical_smiles=smi)
+
 
 
             # ── STEP 2: Drug-likeness Filter ──────────────────────────────────
             t = time.time()
             self._step_start(1)
 
+
             if tox_mode:
                 self._step_skip(1, "Skipped — toxicity report mode screens all compounds")
                 surviving = analogues
+
 
             elif req.pipeline_steps.drug_likeness:
                 passed_lipinski, lipinski_results = filter_by_drug_likeness(
@@ -231,6 +250,7 @@ class PipelineOrchestrator:
                 )
                 for smi, result in zip(analogues, lipinski_results):
                     compound_results[smi].lipinski = result
+
 
                 sol_filter = req.solubility_filter.value if req.solubility_filter else "all"
                 if sol_filter != "all":
@@ -243,10 +263,12 @@ class PipelineOrchestrator:
                 else:
                     sol_label = ""
 
+
                 if req.max_lipinski_violations is None:
                     filter_label = "Lipinski filter ignored (all compounds pass)"
                 else:
                     filter_label = f"≤{req.max_lipinski_violations} violation(s) allowed"
+
 
                 self._step_done(
                     1,
@@ -258,15 +280,17 @@ class PipelineOrchestrator:
                 self._step_skip(1)
                 surviving = analogues
 
+
             if not surviving and not tox_mode:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
+
 
 
             # ── STEP 3: ADMET ─────────────────────────────────────────────────
             t_pdb = time.time()
 
+
             if tox_mode:
-                # ── Tox shortcut (covers pure-tox AND direct+tox) ─────────────
                 self._step_start(2)
                 t_admet = time.time()
                 passed_admet, admet_results = await asyncio.to_thread(
@@ -274,6 +298,7 @@ class PipelineOrchestrator:
                 )
                 for smi, result in zip(surviving, admet_results):
                     compound_results[smi].admet = result
+
 
                 total_flags = sum(len(r.flags) for r in admet_results)
                 high_flags  = sum(
@@ -289,23 +314,24 @@ class PipelineOrchestrator:
                     time.time() - t_admet,
                 )
 
+
                 self._step_skip(3, "Skipped — toxicity report mode")
                 self._step_skip(4, "Skipped — no docking in toxicity report mode")
                 self._step_skip(5, "Skipped — toxicity report mode")
                 self._step_skip(6, "Skipped — toxicity report mode")
 
-                # ── FIX: never raise here — write results even if 0 passed ADMET
-                # The full toxicity profile is still in compound_results for all compounds.
-                surviving      = passed_admet   # may be empty — that's fine
+
+                surviving      = passed_admet
                 receptor_pdbqt = None
 
+
             else:
-                # ── Full pipeline (normal or direct_only) ─────────────────────
                 self._step_start(4)
                 if req.pdb_id:
                     raw_pdb_path = await fetch_pdb_by_id(req.pdb_id, self.job_id)
                 else:
                     raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
+
 
                 if req.pipeline_steps.admet:
                     self._step_start(2)
@@ -317,6 +343,7 @@ class PipelineOrchestrator:
                     )
                     for smi, result in zip(surviving, admet_results):
                         compound_results[smi].admet = result
+
 
                     total_flags = sum(len(r.flags) for r in admet_results)
                     high_flags  = sum(
@@ -348,8 +375,10 @@ class PipelineOrchestrator:
                         time.time() - t_pdb,
                     )
 
+
                 if not surviving:
                     raise RuntimeError("No compounds survived the ADMET filter.")
+
 
 
                 # ── STEP 4: ML Binding Pre-filter ─────────────────────────────
@@ -357,7 +386,7 @@ class PipelineOrchestrator:
                 self._step_start(3)
                 if req.pipeline_steps.binding_prefilter:
                     top_smiles, prefilter_results = await asyncio.to_thread(
-                        run_binding_prefilter, surviving, 10
+                        run_binding_prefilter, surviving, req.max_docking_compounds  # ← FIXED
                     )
                     for smi, result in zip(surviving, prefilter_results):
                         compound_results[smi].binding_prefilter = result
@@ -369,10 +398,11 @@ class PipelineOrchestrator:
                     surviving = top_smiles
                 else:
                     self._step_skip(3)
-                    surviving = surviving[:10]
+                    surviving = surviving[:req.max_docking_compounds]  # ← FIXED
 
                 if not surviving:
                     raise RuntimeError("No compounds survived the binding pre-filter.")
+
 
 
                 # ── STEP 5: Vina Docking ──────────────────────────────────────
@@ -381,6 +411,7 @@ class PipelineOrchestrator:
                 if req.pipeline_steps.docking:
                     def docking_progress(current: int, total: int):
                         self._update_step_progress(5, current, total)
+
 
                     passed_docking, docking_results, binding_site_info = await asyncio.to_thread(
                         dock_compounds,
@@ -401,6 +432,7 @@ class PipelineOrchestrator:
                     self._step_skip(5)
 
 
+
                 # ── STEP 6: Retrosynthesis ────────────────────────────────────
                 t = time.time()
                 self._step_start(6)
@@ -418,6 +450,7 @@ class PipelineOrchestrator:
                     self._step_skip(6)
 
 
+
             # ── STEP 7: Scoring & Ranking (always runs) ───────────────────────
             t = time.time()
             self._step_start(7)
@@ -427,11 +460,14 @@ class PipelineOrchestrator:
             )
             self._step_done(7, f"Ranked {len(ranked)} compounds", time.time() - t)
 
+
             self._write_results(ranked, canonical_smiles, len(analogues), binding_site_info)
             self._write_status("done")
 
+
             if not tox_mode and req.pipeline_steps.docking:
                 cleanup_docking_files(self.job_id)
+
 
 
         except Exception as e:
@@ -445,7 +481,9 @@ class PipelineOrchestrator:
             raise
 
 
+
     # ── Results writer ────────────────────────────────────────────────────────
+
 
 
     def _write_results(
@@ -460,6 +498,7 @@ class PipelineOrchestrator:
                 1 for c in ranked
                 if getattr(c, attr) and getattr(getattr(c, attr), "passed", False)
             )
+
 
         results = JobResultsResponse(
             job_id                    = self.job_id,
