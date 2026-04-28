@@ -2,13 +2,16 @@ import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Callable
-
-
+from typing import Optional
 
 from backend.models.schemas import (
-    JobRequest, JobStatusResponse, JobResultsResponse,
-    PipelineStepInfo, StepStatus, CompoundResult, BindingSiteInfo,
+    JobRequest,
+    JobStatusResponse,
+    JobResultsResponse,
+    PipelineStepInfo,
+    StepStatus,
+    CompoundResult,
+    BindingSiteInfo,
 )
 from backend.pipeline.analogue_gen import generate_analogues
 from backend.pipeline.drug_likeness import (
@@ -25,26 +28,20 @@ from backend.utils.pdb_fetcher import fetch_pdb_by_id, save_pdb_from_content
 from backend.utils.smiles_validator import validate_and_canonicalize
 
 
-
 JOBS_DIR = Path("storage/jobs")
-
 
 
 class PipelineOrchestrator:
     def __init__(self, job_id: str, request: JobRequest):
-        self.job_id     = job_id
-        self.request    = request
-        self.job_dir    = JOBS_DIR / job_id
+        self.job_id = job_id
+        self.request = request
+        self.job_dir = JOBS_DIR / job_id
         self.job_dir.mkdir(parents=True, exist_ok=True)
         self.created_at = datetime.now(timezone.utc)
         self.steps: list[PipelineStepInfo] = []
         self._init_steps()
 
-
-
     # ── Step initialisation ───────────────────────────────────────────────────
-
-
 
     def _init_steps(self):
         step_names = [
@@ -61,93 +58,73 @@ class PipelineOrchestrator:
             self.steps.append(PipelineStepInfo(name=name, status=StepStatus.waiting))
         self._write_status("queued")
 
-
-
     # ── Status helpers ────────────────────────────────────────────────────────
-
-
 
     def _write_status(self, status: str, error: Optional[str] = None):
         payload = JobStatusResponse(
-            job_id=self.job_id, status=status,
-            created_at=self.created_at, updated_at=datetime.now(timezone.utc),
-            steps=self.steps, error=error,
+            job_id=self.job_id,
+            status=status,
+            created_at=self.created_at,
+            updated_at=datetime.now(timezone.utc),
+            steps=self.steps,
+            error=error,
         )
         (self.job_dir / "status.json").write_text(payload.model_dump_json(indent=2))
-
-
 
     def _step_start(self, index: int):
         self.steps[index].status = StepStatus.running
         self._write_status("running")
 
-
-
     def _step_done(self, index: int, message: str, elapsed: float):
-        self.steps[index].status           = StepStatus.done
-        self.steps[index].message          = message
+        self.steps[index].status = StepStatus.done
+        self.steps[index].message = message
         self.steps[index].duration_seconds = round(elapsed, 2)
         self.steps[index].progress_current = None
-        self.steps[index].progress_total   = None
+        self.steps[index].progress_total = None
         self._write_status("running")
 
-
-
     def _step_skip(self, index: int, reason: str = "Disabled by user"):
-        self.steps[index].status  = StepStatus.skipped
+        self.steps[index].status = StepStatus.skipped
         self.steps[index].message = reason
         self._write_status("running")
 
-
-
     def _step_fail(self, index: int, error: str):
-        self.steps[index].status  = StepStatus.failed
+        self.steps[index].status = StepStatus.failed
         self.steps[index].message = error
         self._write_status("failed", error=error)
 
-
-
     def _update_step_progress(self, index: int, current: int, total: int):
         self.steps[index].progress_current = current
-        self.steps[index].progress_total   = total
+        self.steps[index].progress_total = total
         self._write_status("running")
-
-
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
-
-
     async def run(self):
         req = self.request
-        compound_results:  dict[str, CompoundResult] = {}
+        compound_results: dict[str, CompoundResult] = {}
         binding_site_info: Optional[BindingSiteInfo] = None
-
 
         locked_scaffold = getattr(req, "locked_scaffold_smarts", None) or None
 
-
         # ── Routing flags ─────────────────────────────────────────────────────
-        tox_mode    = req.toxicity_report_only
+        tox_mode = req.toxicity_report_only
         direct_only = req.direct_score_only and not req.toxicity_report_only
 
-
+        # ── admet_config — use what the frontend sent, or None for defaults ──
+        admet_config = getattr(req, "admet_config", None)
 
         try:
             is_valid, canonical_smiles, err = validate_and_canonicalize(req.smiles)
             if not is_valid:
                 raise ValueError(f"Invalid SMILES: {err}")
 
-
-
             # ── STEP 1: Analogue Generation ───────────────────────────────────
             t = time.time()
             self._step_start(0)
 
-
             def analogue_progress(current: int, total: int):
                 self._update_step_progress(0, current, total)
-
 
             if tox_mode:
                 if req.direct_score_only:
@@ -171,7 +148,6 @@ class PipelineOrchestrator:
                     if canonical_smiles not in analogues:
                         analogues = [canonical_smiles] + analogues
 
-
                     scaffold_note = " · scaffold locked" if locked_scaffold else ""
                     self._step_done(
                         0,
@@ -190,7 +166,6 @@ class PipelineOrchestrator:
                         time.time() - t,
                     )
 
-
             elif direct_only:
                 analogues = [canonical_smiles]
                 self._step_done(
@@ -198,7 +173,6 @@ class PipelineOrchestrator:
                     "Direct scoring mode — input compound scored as-is (no analogues generated)",
                     time.time() - t,
                 )
-
 
             else:
                 analogues = await asyncio.to_thread(
@@ -212,8 +186,7 @@ class PipelineOrchestrator:
                 if not analogues:
                     raise RuntimeError("Analogue generation produced 0 compounds.")
 
-
-                sol_note      = (
+                sol_note = (
                     f" — solubility filter: {req.solubility_filter.value}"
                     if req.solubility_filter.value != "all"
                     else ""
@@ -225,21 +198,16 @@ class PipelineOrchestrator:
                     time.time() - t,
                 )
 
-
             for smi in analogues:
                 compound_results[smi] = CompoundResult(smiles=smi, canonical_smiles=smi)
-
-
 
             # ── STEP 2: Drug-likeness Filter ──────────────────────────────────
             t = time.time()
             self._step_start(1)
 
-
             if tox_mode:
                 self._step_skip(1, "Skipped — toxicity report mode screens all compounds")
                 surviving = analogues
-
 
             elif req.pipeline_steps.drug_likeness:
                 passed_lipinski, lipinski_results = filter_by_drug_likeness(
@@ -251,24 +219,21 @@ class PipelineOrchestrator:
                 for smi, result in zip(analogues, lipinski_results):
                     compound_results[smi].lipinski = result
 
-
                 sol_filter = req.solubility_filter.value if req.solubility_filter else "all"
                 if sol_filter != "all":
-                    before_sol      = len(passed_lipinski)
+                    before_sol = len(passed_lipinski)
                     passed_lipinski = filter_by_solubility(
                         passed_lipinski, compound_results, sol_filter
                     )
                     sol_dropped = before_sol - len(passed_lipinski)
-                    sol_label   = f" · {sol_dropped} removed by solubility filter ({sol_filter})"
+                    sol_label = f" · {sol_dropped} removed by solubility filter ({sol_filter})"
                 else:
                     sol_label = ""
-
 
                 if req.max_lipinski_violations is None:
                     filter_label = "Lipinski filter ignored (all compounds pass)"
                 else:
                     filter_label = f"≤{req.max_lipinski_violations} violation(s) allowed"
-
 
                 self._step_done(
                     1,
@@ -280,30 +245,26 @@ class PipelineOrchestrator:
                 self._step_skip(1)
                 surviving = analogues
 
-
             if not surviving and not tox_mode:
                 raise RuntimeError("No compounds survived the drug-likeness filter.")
-
-
 
             # ── STEP 3: ADMET ─────────────────────────────────────────────────
             t_pdb = time.time()
 
-
             if tox_mode:
                 self._step_start(2)
                 t_admet = time.time()
+
+                # ← admet_config forwarded from request
                 passed_admet, admet_results = await asyncio.to_thread(
-                    run_admet_batch, surviving
+                    run_admet_batch, surviving, admet_config
                 )
                 for smi, result in zip(surviving, admet_results):
                     compound_results[smi].admet = result
 
-
                 total_flags = sum(len(r.flags) for r in admet_results)
-                high_flags  = sum(
-                    1 for r in admet_results
-                    for f in r.flags if f.severity == "high"
+                high_flags = sum(
+                    1 for r in admet_results for f in r.flags if f.severity == "high"
                 )
                 self._step_done(
                     2,
@@ -314,16 +275,13 @@ class PipelineOrchestrator:
                     time.time() - t_admet,
                 )
 
-
                 self._step_skip(3, "Skipped — toxicity report mode")
                 self._step_skip(4, "Skipped — no docking in toxicity report mode")
                 self._step_skip(5, "Skipped — toxicity report mode")
                 self._step_skip(6, "Skipped — toxicity report mode")
 
-
-                surviving      = passed_admet
+                surviving = passed_admet
                 receptor_pdbqt = None
-
 
             else:
                 self._step_start(4)
@@ -332,23 +290,26 @@ class PipelineOrchestrator:
                 else:
                     raw_pdb_path = save_pdb_from_content(req.pdb_content, self.job_id)
 
-
                 if req.pipeline_steps.admet:
                     self._step_start(2)
-                    t_admet       = time.time()
-                    admet_task    = asyncio.to_thread(run_admet_batch, surviving)
-                    protprep_task = asyncio.to_thread(prepare_receptor, raw_pdb_path, self.job_id)
+                    t_admet = time.time()
+
+                    # ← admet_config forwarded from request
+                    admet_task = asyncio.to_thread(
+                        run_admet_batch, surviving, admet_config
+                    )
+                    protprep_task = asyncio.to_thread(
+                        prepare_receptor, raw_pdb_path, self.job_id
+                    )
                     (passed_admet, admet_results), receptor_pdbqt = await asyncio.gather(
                         admet_task, protprep_task
                     )
                     for smi, result in zip(surviving, admet_results):
                         compound_results[smi].admet = result
 
-
                     total_flags = sum(len(r.flags) for r in admet_results)
-                    high_flags  = sum(
-                        1 for r in admet_results
-                        for f in r.flags if f.severity == "high"
+                    high_flags = sum(
+                        1 for r in admet_results for f in r.flags if f.severity == "high"
                     )
                     self._step_done(
                         2,
@@ -375,18 +336,15 @@ class PipelineOrchestrator:
                         time.time() - t_pdb,
                     )
 
-
                 if not surviving:
                     raise RuntimeError("No compounds survived the ADMET filter.")
-
-
 
                 # ── STEP 4: ML Binding Pre-filter ─────────────────────────────
                 t = time.time()
                 self._step_start(3)
                 if req.pipeline_steps.binding_prefilter:
                     top_smiles, prefilter_results = await asyncio.to_thread(
-                        run_binding_prefilter, surviving, req.max_docking_compounds  # ← FIXED
+                        run_binding_prefilter, surviving, req.max_docking_compounds
                     )
                     for smi, result in zip(surviving, prefilter_results):
                         compound_results[smi].binding_prefilter = result
@@ -398,12 +356,10 @@ class PipelineOrchestrator:
                     surviving = top_smiles
                 else:
                     self._step_skip(3)
-                    surviving = surviving[:req.max_docking_compounds]  # ← FIXED
+                    surviving = surviving[: req.max_docking_compounds]
 
                 if not surviving:
                     raise RuntimeError("No compounds survived the binding pre-filter.")
-
-
 
                 # ── STEP 5: Vina Docking ──────────────────────────────────────
                 t = time.time()
@@ -412,12 +368,16 @@ class PipelineOrchestrator:
                     def docking_progress(current: int, total: int):
                         self._update_step_progress(5, current, total)
 
-
                     passed_docking, docking_results, binding_site_info = await asyncio.to_thread(
                         dock_compounds,
-                        surviving, receptor_pdbqt, self.job_id, raw_pdb_path,
-                        req.binding_site_mode, req.docking_speed,
-                        req.binding_site_coords, req.binding_site_residues,
+                        surviving,
+                        receptor_pdbqt,
+                        self.job_id,
+                        raw_pdb_path,
+                        req.binding_site_mode,
+                        req.docking_speed,
+                        req.binding_site_coords,
+                        req.binding_site_residues,
                         on_progress=docking_progress,
                     )
                     for smi, result in zip(surviving, docking_results):
@@ -430,8 +390,6 @@ class PipelineOrchestrator:
                     surviving = passed_docking if passed_docking else surviving[:3]
                 else:
                     self._step_skip(5)
-
-
 
                 # ── STEP 6: Retrosynthesis ────────────────────────────────────
                 t = time.time()
@@ -449,8 +407,6 @@ class PipelineOrchestrator:
                 else:
                     self._step_skip(6)
 
-
-
             # ── STEP 7: Scoring & Ranking (always runs) ───────────────────────
             t = time.time()
             self._step_start(7)
@@ -460,15 +416,11 @@ class PipelineOrchestrator:
             )
             self._step_done(7, f"Ranked {len(ranked)} compounds", time.time() - t)
 
-
             self._write_results(ranked, canonical_smiles, len(analogues), binding_site_info)
             self._write_status("done")
 
-
             if not tox_mode and req.pipeline_steps.docking:
                 cleanup_docking_files(self.job_id)
-
-
 
         except Exception as e:
             print(f"[Orchestrator] Job {self.job_id} failed: {e}")
@@ -480,37 +432,33 @@ class PipelineOrchestrator:
             self._write_status("failed", error=str(e))
             raise
 
-
-
     # ── Results writer ────────────────────────────────────────────────────────
-
-
 
     def _write_results(
         self,
-        ranked:            list[CompoundResult],
-        base_smiles:       str,
-        total_generated:   int,
+        ranked: list[CompoundResult],
+        base_smiles: str,
+        total_generated: int,
         binding_site_info: Optional[BindingSiteInfo] = None,
     ):
         def _count(attr: str) -> int:
             return sum(
-                1 for c in ranked
+                1
+                for c in ranked
                 if getattr(c, attr) and getattr(getattr(c, attr), "passed", False)
             )
 
-
         results = JobResultsResponse(
-            job_id                    = self.job_id,
-            base_smiles               = base_smiles,
-            total_analogues_generated = total_generated,
-            compounds_after_lipinski  = _count("lipinski"),
-            compounds_after_admet     = _count("admet"),
-            compounds_after_prefilter = _count("binding_prefilter"),
-            compounds_docked          = _count("docking"),
-            final_ranked_compounds    = ranked,
-            binding_site_info         = binding_site_info,
-            created_at                = self.created_at,
-            completed_at              = datetime.now(timezone.utc),
+            job_id=self.job_id,
+            base_smiles=base_smiles,
+            total_analogues_generated=total_generated,
+            compounds_after_lipinski=_count("lipinski"),
+            compounds_after_admet=_count("admet"),
+            compounds_after_prefilter=_count("binding_prefilter"),
+            compounds_docked=_count("docking"),
+            final_ranked_compounds=ranked,
+            binding_site_info=binding_site_info,
+            created_at=self.created_at,
+            completed_at=datetime.now(timezone.utc),
         )
         (self.job_dir / "results.json").write_text(results.model_dump_json(indent=2))
