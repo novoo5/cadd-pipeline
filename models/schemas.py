@@ -340,7 +340,15 @@ class ADMETFlagDetail(BaseModel):
 class ADMETEndpointValue(BaseModel):
     key: str
     label: str
-    category: Literal["absorption", "distribution", "metabolism", "excretion", "toxicity", "physchem", "other"] = "other"
+    category: Literal[
+        "absorption",
+        "distribution",
+        "metabolism",
+        "excretion",
+        "toxicity",
+        "physchem",
+        "other",
+    ] = "other"
     value: float
     display_value: str
     unit: Optional[str] = None
@@ -398,18 +406,36 @@ class DockingResult(BaseModel):
     poses: List[DockingPose]
 
 
+# ── Retrosynthesis ────────────────────────────────────────────────────────────
+
+
 class RetrosynthesisStep(BaseModel):
     step_number: int
     reaction_smarts: str
+    reaction_name: Optional[str] = None
+    reaction_type: Optional[str] = None
     starting_materials: List[str]
+    product_smiles: Optional[str] = None
+    schematic: Optional[str] = None  # "A + B → C" style string
+    reagents: List[str] = Field(default_factory=list)
+    solvents: List[str] = Field(default_factory=list)
+    conditions: Optional[str] = None
+    temperature: Optional[str] = None
+    duration: Optional[str] = None
+    yield_estimate: Optional[str] = None
+    protocol_text: Optional[str] = None  # narrative / protocol paragraph
     confidence: float
 
 
 class RetrosynthesisResult(BaseModel):
     feasible: bool
     num_steps: int
+    sa_score: float = 0.0
     route: List[RetrosynthesisStep]
     complexity_score: float
+    difficulty_label: str = "unknown"  # "easy" / "moderate" / "hard" / "infeasible"
+    synthesis_summary: Optional[str] = None
+    estimated_total_yield: Optional[str] = None
 
 
 class CompoundResult(BaseModel):
