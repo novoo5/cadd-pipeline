@@ -182,9 +182,9 @@ class JobRequest(BaseModel):
         description="ADMET decision thresholds and profile-generation settings.",
     )
 
-    pipeline_steps:        PipelineSteps                = Field(default_factory=PipelineSteps)
+    pipeline_steps:        PipelineSteps               = Field(default_factory=PipelineSteps)
     binding_site_mode:     BindingSiteMode              = BindingSiteMode.auto
-    binding_site_coords:   Optional[BindingSiteCoords]   = None
+    binding_site_coords:   Optional[BindingSiteCoords]  = None
     binding_site_residues: Optional[BindingSiteResidues] = None
     docking_speed:         DockingSpeed                 = DockingSpeed.balanced
 
@@ -271,7 +271,7 @@ class JobStatusResponse(BaseModel):
     error:      Optional[str]          = None
 
 
-# ── Pipeline step results ─────────────────────────────────────────────────────
+# ── Lipinski ──────────────────────────────────────────────────────────────────
 
 
 class LipinskiResult(BaseModel):
@@ -306,12 +306,12 @@ class ADMETEndpointValue(BaseModel):
     ] = "other"
     value:             float
     display_value:     str
-    unit:              Optional[str]  = None
-    interpretation:    Optional[str]  = None
-    threshold_applied: Optional[str]  = None
-    severity:          Optional[str]  = None
-    hard_fail:         bool           = False
-    triggered:         bool           = False
+    unit:              Optional[str] = None
+    interpretation:    Optional[str] = None
+    threshold_applied: Optional[str] = None
+    severity:          Optional[str] = None
+    hard_fail:         bool          = False
+    triggered:         bool          = False
 
 
 class ADMETNarrativeBlock(BaseModel):
@@ -330,18 +330,18 @@ class ADMETResult(BaseModel):
     hepatotoxicity:       float
     oral_bioavailability: float
 
-    flags:          List[ADMETFlagDetail]              = Field(default_factory=list)
-    flag_summary:   List[str]                          = Field(default_factory=list)
-    decision_basis: List[str]                          = Field(default_factory=list)
+    flags:          List[ADMETFlagDetail]            = Field(default_factory=list)
+    flag_summary:   List[str]                        = Field(default_factory=list)
+    decision_basis: List[str]                        = Field(default_factory=list)
 
-    narrative:       List[ADMETNarrativeBlock]          = Field(default_factory=list)
-    endpoint_table:  List[ADMETEndpointValue]           = Field(default_factory=list)
+    narrative:      List[ADMETNarrativeBlock]        = Field(default_factory=list)
+    endpoint_table: List[ADMETEndpointValue]         = Field(default_factory=list)
 
-    extra_properties: Dict[str, float]                  = Field(default_factory=dict)
-    thresholds_used:  Dict[str, ADMETThresholdConfig]   = Field(default_factory=dict)
+    extra_properties: Dict[str, float]               = Field(default_factory=dict)
+    thresholds_used:  Dict[str, ADMETThresholdConfig] = Field(default_factory=dict)
 
 
-# ── Docking results ───────────────────────────────────────────────────────────
+# ── Binding / docking results ─────────────────────────────────────────────────
 
 
 class BindingPrefilterResult(BaseModel):
@@ -368,89 +368,49 @@ class DockingResult(BaseModel):
 
 
 class RetrosynthesisStep(BaseModel):
-    step_number: int
-
-    # Identity
-    reaction_name:  Optional[str] = None
-    reaction_type:  Optional[str] = None
-    reaction_smarts: str          = ""
-
-    # Materials
-    starting_materials: List[str]       = Field(default_factory=list)
+    step_number:        int
+    reaction_name:      str
+    reaction_type:      str
+    reaction_smarts:    str
+    starting_materials: List[str]
     product_smiles:     Optional[str]   = None
-
-    # Lab protocol
-    schematic:      Optional[str]  = None
-    reagents:       List[str]      = Field(default_factory=list)
-    solvents:       List[str]      = Field(default_factory=list)
-    conditions:     Optional[str]  = None
-    temperature:    Optional[str]  = None
-    duration:       Optional[str]  = None
-    protocol_steps: List[str]      = Field(default_factory=list)
-    # protocol_text: auto-joined from protocol_steps, or set directly by caller
-    protocol_text:  Optional[str]  = None
-    notes:          Optional[str]  = None
-
-    # Scoring
-    confidence:      float
-    estimated_yield: Optional[str] = None
-
-    @model_validator(mode="after")
-    def join_protocol_text(self) -> "RetrosynthesisStep":
-        # If caller provided protocol_steps but not protocol_text, join them.
-        if self.protocol_steps and not self.protocol_text:
-            object.__setattr__(
-                self,
-                "protocol_text",
-                "\n".join(f"{i + 1}. {s}" for i, s in enumerate(self.protocol_steps)),
-            )
-        return self
+    schematic:          str             = ""
+    reagents:           List[str]       = Field(default_factory=list)
+    conditions:         str             = ""
+    protocol_steps:     List[str]       = Field(default_factory=list)
+    confidence:         float
+    estimated_yield:    Optional[str]   = None
+    notes:              Optional[str]   = None
 
 
 class RetrosynthesisResult(BaseModel):
-    feasible:         bool
-    num_steps:        int
-    route:            List[RetrosynthesisStep]
-    complexity_score: float
+    feasible:          bool
+    num_steps:         int
+    route:             List[RetrosynthesisStep]
+    complexity_score:  float
 
-    # Extended fields from retrosynthesis.py
-    sa_score:                   Optional[float] = None
-    complexity_category:        Optional[str]   = None
-    functional_groups_detected: List[str]       = Field(default_factory=list)
-    disconnection_points:       List[str]       = Field(default_factory=list)
-    synthesis_overview:         Optional[str]   = None
-    alternative_routes_hint:    Optional[str]   = None
-    estimated_total_yield:      Optional[str]   = None
-
-    # Frontend aliases — auto-populated from above fields
-    difficulty_label:  Optional[str] = None   # mirrors complexity_category
-    synthesis_summary: Optional[str] = None   # mirrors synthesis_overview
-
-    @model_validator(mode="after")
-    def sync_frontend_aliases(self) -> "RetrosynthesisResult":
-        if self.complexity_category and not self.difficulty_label:
-            object.__setattr__(self, "difficulty_label", self.complexity_category)
-        if self.synthesis_overview and not self.synthesis_summary:
-            object.__setattr__(self, "synthesis_summary", self.synthesis_overview)
-        return self
+    # Extended fields written by retrosynthesis.py
+    sa_score:                    float           = 0.0
+    complexity_category:         str             = "unknown"
+    functional_groups_detected:  List[str]       = Field(default_factory=list)
+    disconnection_points:        List[str]       = Field(default_factory=list)
+    synthesis_overview:          str             = ""
+    alternative_routes_hint:     Optional[str]   = None
 
 
-# ── Compound result ───────────────────────────────────────────────────────────
+# ── Compound + job response models ────────────────────────────────────────────
 
 
 class CompoundResult(BaseModel):
-    smiles:           str
-    canonical_smiles: str
-    rank:             Optional[int]                    = None
-    final_score:      Optional[float]                  = None
-    lipinski:         Optional[LipinskiResult]         = None
-    admet:            Optional[ADMETResult]            = None
+    smiles:            str
+    canonical_smiles:  str
+    rank:              Optional[int]                    = None
+    final_score:       Optional[float]                  = None
+    lipinski:          Optional[LipinskiResult]         = None
+    admet:             Optional[ADMETResult]            = None
     binding_prefilter: Optional[BindingPrefilterResult] = None
-    docking:          Optional[DockingResult]          = None
-    retrosynthesis:   Optional[RetrosynthesisResult]   = None
-
-
-# ── Job responses ─────────────────────────────────────────────────────────────
+    docking:           Optional[DockingResult]          = None
+    retrosynthesis:    Optional[RetrosynthesisResult]   = None
 
 
 class JobResultsResponse(BaseModel):

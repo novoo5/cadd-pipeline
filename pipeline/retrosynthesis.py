@@ -8,20 +8,17 @@ Provides:
   - Named reactions with reagents, conditions, and step-by-step protocol
   - Reaction schematics (A + B → Product)
   - Synthesis narrative overview
-  
+
 All analysis is purely RDKit-based — no external API required.
 """
 
 import asyncio
+import re
 from typing import List, Dict, Optional, Tuple, Any
 from backend.models.schemas import RetrosynthesisResult, RetrosynthesisStep
 
 
 # ── Reaction knowledge base ────────────────────────────────────────────────────
-#
-# Each entry maps a detectable functional group (SMARTS) to the
-# retrosynthetic disconnection that most likely formed it.
-# Priority = order in list (earlier = checked first = higher retrosynthetic value).
 
 _REACTION_KB: List[Dict[str, Any]] = [
     {
@@ -304,13 +301,10 @@ _REACTION_KB: List[Dict[str, Any]] = [
 
 # ── Async entry point ─────────────────────────────────────────────────────────
 
+
 async def run_retrosynthesis_batch(
     smiles_list: List[str],
 ) -> List[RetrosynthesisResult]:
-    """
-    SA Score-based feasibility + functional-group disconnection analysis.
-    Pure RDKit — no external service required.
-    """
     results = []
     for i, smi in enumerate(smiles_list):
         try:
@@ -324,12 +318,12 @@ async def run_retrosynthesis_batch(
 
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
+
 def _assess_single(smiles: str) -> RetrosynthesisResult:
     from rdkit import Chem, RDConfig
-    from rdkit.Chem import rdMolDescriptors
-    import os, sys
+    import os
+    import sys
 
-    # Load SA Score contrib module (ships with all RDKit distributions)
     sa_score_path = os.path.join(RDConfig.RDContribDir, "SA_Score")
     if sa_score_path not in sys.path:
         sys.path.append(sa_score_path)
@@ -341,12 +335,6 @@ def _assess_single(smiles: str) -> RetrosynthesisResult:
 
     sa_score = sascorer.calculateScore(mol)
     print(f"[Retro] SA Score for {smiles[:50]}: {sa_score:.3f}")
-
-    # ── Feasibility thresholds (literature standard) ──────────────────────
-    # 1.0 – 3.5 : Easy (commercial building blocks, 1-3 steps)
-    # 3.5 – 5.0 : Moderate (4-6 steps, needs skilled chemist)
-    # 5.0 – 6.0 : Hard (6-8 steps, multi-step campaign)
-    # 6.0 – 10.0: Very hard / practically infeasible
 
     feasible = sa_score <= 6.5
 
@@ -363,10 +351,7 @@ def _assess_single(smiles: str) -> RetrosynthesisResult:
     else:
         num_steps, category = 0, "infeasible"
 
-    # ── Detect functional groups ──────────────────────────────────────────
     detected_fgs = _detect_functional_groups(mol)
-
-    # ── Build disconnection-based synthesis steps ─────────────────────────
     starting_materials = _fragment_molecule(mol)
     canonical_smiles = Chem.MolToSmiles(mol)
 
@@ -379,7 +364,6 @@ def _assess_single(smiles: str) -> RetrosynthesisResult:
         feasible=feasible,
     )
 
-    # ── Build human-readable synthesis overview ───────────────────────────
     overview = _build_overview(
         smiles=canonical_smiles,
         sa_score=sa_score,
@@ -389,10 +373,7 @@ def _assess_single(smiles: str) -> RetrosynthesisResult:
         starting_materials=starting_materials,
     )
 
-    # ── Alternative routes hint ───────────────────────────────────────────
     alt_hint = _alt_routes_hint(detected_fgs)
-
-    # Complexity score 0–100 for pipeline scorer
     complexity = round(sa_score * 10.0, 1)
 
     return RetrosynthesisResult(
@@ -411,15 +392,12 @@ def _assess_single(smiles: str) -> RetrosynthesisResult:
 
 # ── Functional group detection ────────────────────────────────────────────────
 
+
 def _detect_functional_groups(mol) -> List[Dict[str, Any]]:
-    """
-    Match SMARTS patterns against the molecule in priority order.
-    Returns up to 4 matched entries (avoids over-reporting overlapping groups).
-    """
     from rdkit import Chem
 
     matched: List[Dict[str, Any]] = []
-    seen_fg_names = set()
+    seen_fg_names: set = set()
 
     for entry in _REACTION_KB:
         if entry["fg_name"] in seen_fg_names:
@@ -441,6 +419,7 @@ def _detect_functional_groups(mol) -> List[Dict[str, Any]]:
 
 # ── Synthesis step builder ────────────────────────────────────────────────────
 
+
 def _build_synthesis_steps(
     mol,
     detected_fgs: List[Dict[str, Any]],
@@ -449,10 +428,6 @@ def _build_synthesis_steps(
     sa_score: float,
     feasible: bool,
 ) -> List[RetrosynthesisStep]:
-    """
-    Build a list of RetrosynthesisStep objects from detected functional groups.
-    Each step covers one key bond disconnection.
-    """
     from rdkit import Chem
 
     if not feasible:
@@ -464,17 +439,13 @@ def _build_synthesis_steps(
 
     for idx, fg in enumerate(detected_fgs):
         step_num = idx + 1
-
-        # Schematic: use template with generic labels
         schematic = fg.get("schematic_template", "A + B → Product")
 
-        # Starting materials: use BRICS fragments for step 1, generic labels after
         if idx == 0:
             sm_list = starting_materials[:3] if starting_materials else ["Fragment A", "Fragment B"]
         else:
             sm_list = [f"Intermediate from Step {idx}", "Reagent"]
 
-        # Confidence degrades slightly for later steps (more uncertainty)
         step_confidence = round(max(0.1, confidence_base - idx * 0.05), 3)
 
         step = RetrosynthesisStep(
@@ -494,7 +465,6 @@ def _build_synthesis_steps(
         )
         steps.append(step)
 
-    # Always add a final assembly/purification step
     if steps:
         steps.append(
             RetrosynthesisStep(
@@ -530,6 +500,7 @@ def _build_synthesis_steps(
 
 # ── Narrative overview ────────────────────────────────────────────────────────
 
+
 def _build_overview(
     smiles: str,
     sa_score: float,
@@ -543,18 +514,16 @@ def _build_overview(
 
     fg_str = ", ".join(fg_names) if fg_names else "no complex functional groups"
     rxn_str = "; ".join(rxn_types) if rxn_types else "straightforward chemistry"
-
     sm_str = (
         ", ".join(starting_materials[:3]) + (" ..." if len(starting_materials) > 3 else "")
         if starting_materials else "commercial building blocks"
     )
-
     step_word = "step" if num_steps == 1 else "steps"
 
     feasibility_note = {
-        "easy": "This compound should be readily accessible in a typical medicinal chemistry lab.",
-        "moderate": "Synthesis is achievable but requires careful planning and execution.",
-        "hard": "Multi-step synthesis requiring significant resource investment. Consider analogue simplification.",
+        "easy":      "This compound should be readily accessible in a typical medicinal chemistry lab.",
+        "moderate":  "Synthesis is achievable but requires careful planning and execution.",
+        "hard":      "Multi-step synthesis requiring significant resource investment. Consider analogue simplification.",
         "very hard": "Highly complex; consider whether simpler analogues retain activity.",
         "infeasible": "SA Score indicates this molecule is practically infeasible to synthesise with current methods.",
     }.get(category, "")
@@ -571,11 +540,11 @@ def _build_overview(
 
 def _alt_routes_hint(detected_fgs: List[Dict[str, Any]]) -> Optional[str]:
     hints = {
-        "Amide": "Alternative amide routes: acyl chloride + amine (faster); Weinreb amide for ketone synthesis.",
-        "Biaryl": "Alternative biaryl couplings: Negishi (ArZnX), Kumada (ArMgX), Stille (ArSnBu₃).",
+        "Amide":                "Alternative amide routes: acyl chloride + amine (faster); Weinreb amide for ketone synthesis.",
+        "Biaryl":               "Alternative biaryl couplings: Negishi (ArZnX), Kumada (ArMgX), Stille (ArSnBu₃).",
         "Aryl Amine (Aniline)": "Alternative aryl C–N: SNAr (no Pd, needs EWG on ring); Chan-Lam (ArB(OH)₂ + amine, Cu cat).",
-        "Ester": "Alternative ester routes: acyl chloride + alcohol; enzymatic esterification for selectivity.",
-        "Nitrile": "Alternative nitrile routes: Rosenmund-von Braun (CuCN, NMP, 170°C) for aryl nitriles.",
+        "Ester":                "Alternative ester routes: acyl chloride + alcohol; enzymatic esterification for selectivity.",
+        "Nitrile":              "Alternative nitrile routes: Rosenmund-von Braun (CuCN, NMP, 170°C) for aryl nitriles.",
     }
     fg_names = [fg["fg_name"] for fg in detected_fgs]
     relevant = [hints[n] for n in fg_names if n in hints]
@@ -584,19 +553,16 @@ def _alt_routes_hint(detected_fgs: List[Dict[str, Any]]) -> Optional[str]:
 
 # ── BRICS fragmentation ───────────────────────────────────────────────────────
 
+
 def _fragment_molecule(mol) -> List[str]:
-    """
-    BRICS decomposition — identifies likely synthetically accessible subunits.
-    """
-    from rdkit.Chem import BRICS, AllChem
+    from rdkit.Chem import BRICS
     from rdkit import Chem
 
     try:
         frags = BRICS.BRICSDecompose(mol)
-        import re
         clean = []
         for frag in frags:
-            # Remove all BRICS dummy atom labels like [3*], [14*]
+            # Strip BRICS dummy atom labels like [3*], [14*]  ← fixed regex (was double-escaped)
             cleaned = re.sub(r"\[\d+\*\]", "[H]", frag)
             m = Chem.MolFromSmiles(cleaned)
             if m and m.GetNumHeavyAtoms() >= 3:
@@ -607,6 +573,7 @@ def _fragment_molecule(mol) -> List[str]:
 
 
 # ── Error result ──────────────────────────────────────────────────────────────
+
 
 def _make_failed_result(reason: str) -> RetrosynthesisResult:
     print(f"[Retro] Failed: {reason}")
