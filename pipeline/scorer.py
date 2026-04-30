@@ -40,7 +40,7 @@ MW_MIN = 200.0
 
 def score_and_rank(
     compounds:      List[CompoundResult],
-    pipeline_steps: Optional[PipelineSteps] = None,   # ← NEW
+    pipeline_steps: Optional[PipelineSteps] = None,
 ) -> List[CompoundResult]:
     for compound in compounds:
         compound.final_score = _compute_score(compound, pipeline_steps)
@@ -54,10 +54,9 @@ def score_and_rank(
 
 def _docking_was_queued(c: CompoundResult) -> bool:
     """
-    Returns True if docking was supposed to run for this compound but didn't
-    complete — i.e. it passed the binding prefilter but has no docking result.
+    True if this compound made it through the binding prefilter but has no docking
+    result — meaning docking was attempted but didn't complete (timeout/crash).
     Used only in get_score_breakdown() for human-readable explanation.
-    The actual score gate is in _compute_score() via pipeline_steps.
     """
     return (
         c.binding_prefilter is not None
@@ -68,27 +67,26 @@ def _docking_was_queued(c: CompoundResult) -> bool:
 
 def _compute_score(
     c:              CompoundResult,
-    pipeline_steps: Optional[PipelineSteps] = None,   # ← NEW
+    pipeline_steps: Optional[PipelineSteps] = None,
 ) -> float:
 
-    # ── Hard zero: docking was enabled but compound has no docking result ─────
-    # Covers ALL cases: timeout, pre-filter wiped everything, crash, etc.
+    # Hard zero: docking was enabled in the pipeline but this compound has no result.
+    # Covers timeouts, prefilter wipeouts, crashes, etc.
     # A compound that never docked cannot outrank compounds that did.
     if pipeline_steps is not None and pipeline_steps.docking and c.docking is None:
         return 0.0
-    # ─────────────────────────────────────────────────────────────────────────
 
     earned   = 0.0
     possible = 0.0
 
     # ── 1. Docking affinity (50 pts) ──────────────────────────────────────────
     if c.docking and c.docking.best_affinity_kcal != 0.0:
-        aff       = c.docking.best_affinity_kcal
-        earned   += _normalize(aff, AFFINITY_WORST, AFFINITY_BEST) * WEIGHTS["docking_affinity"]
+        aff      = c.docking.best_affinity_kcal
+        earned  += _normalize(aff, AFFINITY_WORST, AFFINITY_BEST) * WEIGHTS["docking_affinity"]
         possible += WEIGHTS["docking_affinity"]
     elif _docking_was_queued(c):
-        # Fallback when pipeline_steps not passed in (legacy calls):
-        # award 0 pts but count weight as possible so score isn't inflated
+        # Docking was attempted but didn't finish — award 0 pts but keep weight
+        # in possible so the score isn't inflated by the missing component.
         possible += WEIGHTS["docking_affinity"]
 
     # ── 2. ADMET safety (20 pts) ──────────────────────────────────────────────
@@ -109,16 +107,16 @@ def _compute_score(
 
     # ── 4. Binding prefilter GNN score (10 pts) ───────────────────────────────
     if c.binding_prefilter and c.binding_prefilter.confidence >= 0.4:
-        pre       = c.binding_prefilter.predicted_affinity_kcal
-        norm      = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
-        earned   += norm * WEIGHTS["binding_prefilter"]
+        pre      = c.binding_prefilter.predicted_affinity_kcal
+        norm     = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
+        earned  += norm * WEIGHTS["binding_prefilter"]
         possible += WEIGHTS["binding_prefilter"]
 
     # ── 5. Synthesis ease (10 pts) ────────────────────────────────────────────
     if c.retrosynthesis and c.retrosynthesis.feasible:
-        comp      = c.retrosynthesis.complexity_score
-        norm      = _normalize(comp, COMPLEXITY_WORST, COMPLEXITY_BEST)
-        earned   += norm * WEIGHTS["synthesis_ease"]
+        comp     = c.retrosynthesis.complexity_score
+        norm     = _normalize(comp, COMPLEXITY_WORST, COMPLEXITY_BEST)
+        earned  += norm * WEIGHTS["synthesis_ease"]
         possible += WEIGHTS["synthesis_ease"]
     elif c.retrosynthesis and not c.retrosynthesis.feasible:
         possible += WEIGHTS["synthesis_ease"]
@@ -126,7 +124,6 @@ def _compute_score(
     if possible == 0.0:
         return 0.0
 
-    # ── Dynamic reweighting ───────────────────────────────────────────────────
     scaled = (earned / possible) * 100.0
 
     # ── MW fragment penalty ───────────────────────────────────────────────────
@@ -151,21 +148,7 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
     c         = compound
     breakdown = {}
 
-    if pipeline_steps_docking_enabled := (c.docking is None):
-        # Show hard-zero reason if docking was expected
-        if _docking_was_queued(c):
-            breakdown["docking_affinity"] = {
-                "raw":          "Docking did not complete (job timeout) — 0 pts, compound excluded from ranking",
-                "contribution": 0.0,
-                "max_possible": WEIGHTS["docking_affinity"],
-            }
-        elif c.docking is None:
-            breakdown["docking_affinity"] = {
-                "raw":          "No docking result — compound scored 0 and excluded from ranking",
-                "contribution": 0.0,
-                "max_possible": WEIGHTS["docking_affinity"],
-            }
-    
+    # ── Docking ───────────────────────────────────────────────────────────────
     if c.docking and c.docking.best_affinity_kcal != 0.0:
         aff  = c.docking.best_affinity_kcal
         norm = _normalize(aff, AFFINITY_WORST, AFFINITY_BEST)
@@ -174,7 +157,20 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
             "contribution": round(norm * WEIGHTS["docking_affinity"], 2),
             "max_possible": WEIGHTS["docking_affinity"],
         }
+    elif _docking_was_queued(c):
+        breakdown["docking_affinity"] = {
+            "raw":          "Docking did not complete (job timeout) — 0 pts, compound excluded from ranking",
+            "contribution": 0.0,
+            "max_possible": WEIGHTS["docking_affinity"],
+        }
+    elif c.docking is None:
+        breakdown["docking_affinity"] = {
+            "raw":          "No docking result — compound scored 0 and excluded from ranking",
+            "contribution": 0.0,
+            "max_possible": WEIGHTS["docking_affinity"],
+        }
 
+    # ── ADMET ─────────────────────────────────────────────────────────────────
     if c.admet:
         num_flags    = len(c.admet.flags)
         safety_map   = {0: 1.0, 1: 0.6, 2: 0.3}
@@ -188,6 +184,7 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
             "max_possible": WEIGHTS["admet_safety"],
         }
 
+    # ── Solubility ────────────────────────────────────────────────────────────
     if c.lipinski:
         sol_class = c.lipinski.solubility_class
         sol_norm  = SOLUBILITY_SCORES.get(sol_class, 0.0)
@@ -199,6 +196,7 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
             "max_possible": WEIGHTS["solubility"],
         }
 
+    # ── Binding prefilter ─────────────────────────────────────────────────────
     if c.binding_prefilter and c.binding_prefilter.confidence >= 0.4:
         pre  = c.binding_prefilter.predicted_affinity_kcal
         norm = _normalize(pre, AFFINITY_WORST, AFFINITY_BEST)
@@ -208,6 +206,7 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
             "max_possible": WEIGHTS["binding_prefilter"],
         }
 
+    # ── Retrosynthesis ────────────────────────────────────────────────────────
     if c.retrosynthesis:
         if c.retrosynthesis.feasible:
             comp = c.retrosynthesis.complexity_score
@@ -224,6 +223,7 @@ def get_score_breakdown(compound: CompoundResult) -> dict:
                 "max_possible": WEIGHTS["synthesis_ease"],
             }
 
+    # ── Penalties ─────────────────────────────────────────────────────────────
     breakdown["mw_fragment_penalty"] = bool(c.lipinski and c.lipinski.mw < MW_MIN)
     breakdown["final_score"]         = c.final_score
     return breakdown

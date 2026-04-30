@@ -108,7 +108,7 @@ class PipelineOrchestrator:
         locked_scaffold = getattr(req, "locked_scaffold_smarts", None) or None
 
         # ── Routing flags ─────────────────────────────────────────────────────
-        tox_mode = req.toxicity_report_only
+        tox_mode    = req.toxicity_report_only
         direct_only = req.direct_score_only and not req.toxicity_report_only
 
         # ── admet_config — use what the frontend sent, or None for defaults ──
@@ -255,7 +255,6 @@ class PipelineOrchestrator:
                 self._step_start(2)
                 t_admet = time.time()
 
-                # ← admet_config forwarded from request
                 passed_admet, admet_results = await asyncio.to_thread(
                     run_admet_batch, surviving, admet_config
                 )
@@ -280,7 +279,7 @@ class PipelineOrchestrator:
                 self._step_skip(5, "Skipped — toxicity report mode")
                 self._step_skip(6, "Skipped — toxicity report mode")
 
-                surviving = passed_admet
+                surviving      = passed_admet
                 receptor_pdbqt = None
 
             else:
@@ -294,7 +293,6 @@ class PipelineOrchestrator:
                     self._step_start(2)
                     t_admet = time.time()
 
-                    # ← admet_config forwarded from request
                     admet_task = asyncio.to_thread(
                         run_admet_batch, surviving, admet_config
                     )
@@ -461,4 +459,5 @@ class PipelineOrchestrator:
             created_at=self.created_at,
             completed_at=datetime.now(timezone.utc),
         )
+        # ← THIS LINE WAS MISSING FROM YOUR PASTE — it was displaced to end of scorer.py
         (self.job_dir / "results.json").write_text(results.model_dump_json(indent=2))

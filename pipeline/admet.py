@@ -742,3 +742,5 @@ def _fallback_admet(
             results.append(_make_error_result(f"Fallback ADMET error: {e}", thresholds))
 
     return passed, results
+# Backward-compat alias — any file importing THRESHOLDS directly still works
+THRESHOLDS = DEFAULT_THRESHOLDS
