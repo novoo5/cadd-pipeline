@@ -1,7 +1,6 @@
 """
 Dynamic compound scoring and ranking.
 
-
 v4 changes over v3:
   - binding_prefilter is fully excluded from scoring and weight redistribution.
     It runs as a pipeline gate (pass/fail filter) but contributes 0 pts to
@@ -13,20 +12,15 @@ v4 changes over v3:
   - _build_breakdown() no longer emits a binding_prefilter score entry.
 """
 
-
 from __future__ import annotations
-
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-
 from backend.models.schemas import CompoundResult, PipelineSteps
 
 
-
 # ── Scoring config ────────────────────────────────────────────────────────────
-
 
 
 @dataclass
@@ -35,26 +29,23 @@ class ScoringConfig:
     All scoring parameters in one place.
 
     binding_prefilter is intentionally absent from weights — it acts as a
-    pipeline gate only. Its old 12-pt share is pre-distributed to the
-    remaining four components so base weights still sum to 100.
+    pipeline gate only.
 
     Base weights (binding_prefilter excluded):
-      docking_affinity  51   (was 45 + share of 12)
-      admet_safety      28   (was 25 + share of 12)
-      drug_likeness     11   (was 10 + share of 12)
-      synthesis_ease     9   (was  8 + share of 12)
+      docking_affinity  50
+      admet_safety      25
+      drug_likeness     15
+      synthesis_ease    10
       ─────────────────────
-      total            99   → rounded up to 100 via largest-remainder
-
-    Actual values below are exact integers summing to 100.
+      total            100
     """
 
     # Base weights — must sum to 100, binding_prefilter NOT included
     weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "docking_affinity": 51,
-            "admet_safety":     28,
-            "drug_likeness":    11,
+            "docking_affinity": 50,
+            "admet_safety":     25,
+            "drug_likeness":    15,
             "synthesis_ease":   10,
         }
     )
@@ -108,13 +99,6 @@ class ScoringConfig:
 
     # LogS breakpoints — (threshold, score): applies when logS >= threshold.
     # Sorted from least-negative to most-negative (highest to lowest logS).
-    #
-    # Scientific rationale:
-    #   logS > -3  = soluble in any practical sense (~1 mg/mL+) → scores well.
-    #   logS -3→-4 = decent for oral delivery; many approved drugs sit here.
-    #   logS -4→-5 = borderline; formulation may help but not a blocker.
-    #   logS < -5  = genuinely poor solubility; affects bioavailability.
-    #   logS < -6  = problematic; will likely need formulation strategy.
     logs_breakpoints: List[Tuple[float, float]] = field(
         default_factory=lambda: [
             (-1.0, 1.00),   # logS ≥ -1:  very soluble   → perfect
@@ -155,9 +139,7 @@ _HARD_FAIL_ENDPOINTS = {"hERG Inhibition", "Hepatotoxicity"}
 _EXCLUDED_FROM_SCORING = {"binding_prefilter"}
 
 
-
 # ── Public API ────────────────────────────────────────────────────────────────
-
 
 
 def score_and_rank(
@@ -178,7 +160,6 @@ def score_and_rank(
     return ranked
 
 
-
 def get_score_breakdown(
     compound:       CompoundResult,
     pipeline_steps: Optional[PipelineSteps] = None,
@@ -187,7 +168,6 @@ def get_score_breakdown(
     cfg = config or DEFAULT_CONFIG
     effective_weights = _resolve_active_weights(pipeline_steps, cfg)
     return _build_breakdown(compound, cfg, effective_weights)
-
 
 
 def get_effective_weights(
@@ -202,9 +182,7 @@ def get_effective_weights(
     return _resolve_active_weights(pipeline_steps, cfg)
 
 
-
 # ── Weight redistribution ─────────────────────────────────────────────────────
-
 
 
 def _resolve_active_weights(
@@ -219,10 +197,10 @@ def _resolve_active_weights(
     All returned weights are whole integers summing to 100 via
     largest-remainder rounding.
 
-    Example: if docking (51 pts) is disabled:
-      - active base total = 49 pts
-      - each active weight is scaled by 100/49 then rounded to integers
-      - docking_affinity effective weight = 0
+    Example: if docking (50 pts) and admet (25 pts) are disabled:
+      - active base total = 25 pts
+      - each active weight is scaled by 100/25 then rounded to integers
+      - docking_affinity and admet_safety effective weight = 0
     """
     if pipeline_steps is None:
         return _round_to_whole_numbers({k: float(w) for k, w in cfg.weights.items()})
@@ -255,7 +233,6 @@ def _resolve_active_weights(
     return _round_to_whole_numbers(float_weights)
 
 
-
 def _round_to_whole_numbers(weights: Dict[str, float]) -> Dict[str, float]:
     """
     Largest-remainder method: rounds floats to integers while guaranteeing
@@ -283,9 +260,7 @@ def _round_to_whole_numbers(weights: Dict[str, float]) -> Dict[str, float]:
     return result
 
 
-
 # ── Core scoring ──────────────────────────────────────────────────────────────
-
 
 
 def _compute_score(
@@ -330,16 +305,13 @@ def _compute_score(
     return round(min(max(scaled, 0.0), 100.0), 2)
 
 
-
 # ── Component scorers ─────────────────────────────────────────────────────────
-
 
 
 def _score_docking(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     if c.docking is None or c.docking.best_affinity_kcal == 0.0:
         return None
     return _normalize(c.docking.best_affinity_kcal, cfg.affinity_worst, cfg.affinity_best)
-
 
 
 def _score_admet(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
@@ -360,7 +332,6 @@ def _score_admet(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
         cumulative_penalty += pen
 
     return max(0.0, base - min(cumulative_penalty, base))
-
 
 
 def _score_drug_likeness(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
@@ -395,7 +366,6 @@ def _score_drug_likeness(c: CompoundResult, cfg: ScoringConfig) -> Optional[floa
     return min(max(combined, 0.0), 1.0)
 
 
-
 def _score_synthesis(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     if c.retrosynthesis is None:
         return None
@@ -421,9 +391,7 @@ def _score_synthesis(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     return complexity_score * 0.60 + step_score * 0.40
 
 
-
 # ── Breakdown ─────────────────────────────────────────────────────────────────
-
 
 
 def _build_breakdown(
@@ -433,6 +401,9 @@ def _build_breakdown(
 ) -> dict:
     bd: dict = {}
 
+    # active_total = sum of non-zero effective weights (= denominator used in _compute_score)
+    active_total = sum(v for v in effective_weights.values() if v > 0.0)
+
     def _entry(
         key:          str,
         score:        Optional[float],
@@ -440,17 +411,26 @@ def _build_breakdown(
         explanation:  str,
         data_present: bool = True,
     ) -> dict:
-        ew = effective_weights.get(key, 0.0)      # whole-number pts (e.g. 51)
+        ew = effective_weights.get(key, 0.0)   # whole-number pts (e.g. 50)
         bw = cfg.weights.get(key, 0.0)
         s  = score if (score is not None and data_present) else 0.0
-        # contribution is also a whole-number-friendly value:
-        # score_0_to_1 × effective_weight gives pts earned out of ew
-        contribution = round(s * ew, 1)
+
+        # contribution: pts earned scaled so ALL contributions sum to final_score
+        # = score_0_to_1 × (ew / active_total) × 100
+        # This guarantees sum(contributions) == final_score (before MW penalty)
+        scale_factor = (ew / active_total * 100.0) if active_total > 0 else 0.0
+        contribution = round(s * scale_factor, 1)
+
+        # max_possible in same scale = ew / active_total × 100
+        # When all steps active: max_possible == ew (e.g. 50 pts)
+        # When steps disabled: max_possible scales up to reflect redistribution
+        max_pts = round(scale_factor, 1)
+
         return {
             "score_0_to_1":     round(s, 3),
             "raw":              raw,
-            "contribution":     contribution,       # pts earned  (e.g. 25.5)
-            "max_possible":     ew,                 # whole-number max (e.g. 51)
+            "contribution":     contribution,   # pts earned  (sums to final_score)
+            "max_possible":     max_pts,        # max pts for this component
             "base_weight":      bw,
             "effective_weight": ew,
             "explanation":      explanation,
@@ -536,7 +516,7 @@ def _build_breakdown(
             "explanation":  (
                 "Binding prefilter acts as a pass/fail gate only — "
                 "it contributes 0 pts to the final score. "
-                "Its former 12-pt weight has been redistributed to the four scoring components."
+                "Its former weight has been redistributed to the four scoring components."
             ),
         }
 
@@ -556,9 +536,9 @@ def _build_breakdown(
 
     # ── Weight redistribution info ────────────────────────────────────────────
     bd["weight_redistribution"] = {
-        "base_weights":         {k: cfg.weights[k] for k in cfg.weights},
-        "effective_weights":    {k: round(v, 0) for k, v in effective_weights.items()},
-        "disabled_components":  [k for k, v in effective_weights.items() if v == 0.0],
+        "base_weights":          {k: cfg.weights[k] for k in cfg.weights},
+        "effective_weights":     {k: round(v, 0) for k, v in effective_weights.items()},
+        "disabled_components":   [k for k, v in effective_weights.items() if v == 0.0],
         "excluded_from_scoring": list(_EXCLUDED_FROM_SCORING),
         "note": (
             "Effective weights are whole integers summing to 100. "
@@ -581,16 +561,13 @@ def _build_breakdown(
     return bd
 
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
 
 
 def _normalize(value: float, worst: float, best: float) -> float:
     if best == worst:
         return 0.0
     return min(max((value - worst) / (best - worst), 0.0), 1.0)
-
 
 
 def _count_lipinski_violations(lipinski) -> int:
@@ -600,7 +577,6 @@ def _count_lipinski_violations(lipinski) -> int:
     if lipinski.hbd  > 5:   violations += 1
     if lipinski.hba  > 10:  violations += 1
     return violations
-
 
 
 def _docking_was_attempted(c: CompoundResult) -> bool:
