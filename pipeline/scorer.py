@@ -1,26 +1,32 @@
 """
 Dynamic compound scoring and ranking.
 
-v3 changes over v2:
-  - Explicit weight redistribution via _resolve_active_weights():
-    disabled pipeline steps lose their weight entirely; remaining
-    components are scaled proportionally so effective weights always
-    sum to 100. No denominator tricks — it's a first-class operation.
-  - Kinder logS scoring: logS=-3 is genuinely soluble and should not
-    score 3/10. New breakpoints: >=−4 = good, >=−5 = marginal, <−5 = bad.
-  - _compute_score() uses resolved weights directly, not base weights.
-  - Breakdown now shows both base_weight and effective_weight per component.
+
+v4 changes over v3:
+  - binding_prefilter is fully excluded from scoring and weight redistribution.
+    It runs as a pipeline gate (pass/fail filter) but contributes 0 pts to
+    the final score. Its base weight is redistributed before scoring begins.
+  - All effective weights are rounded to whole numbers (integer pts) for
+    clean display. Rounding uses largest-remainder method so weights always
+    sum exactly to 100.
+  - Score contributions are also whole-number pts for cleaner UX.
+  - _build_breakdown() no longer emits a binding_prefilter score entry.
 """
 
+
 from __future__ import annotations
+
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+
 from backend.models.schemas import CompoundResult, PipelineSteps
 
 
+
 # ── Scoring config ────────────────────────────────────────────────────────────
+
 
 
 @dataclass
@@ -28,45 +34,48 @@ class ScoringConfig:
     """
     All scoring parameters in one place.
 
-    Base weights define relative importance when ALL steps run.
-    When a step is disabled or skipped, its weight is redistributed
-    proportionally to the remaining active components via
-    _resolve_active_weights(). The final scoring denominator is always 100.
+    binding_prefilter is intentionally absent from weights — it acts as a
+    pipeline gate only. Its old 12-pt share is pre-distributed to the
+    remaining four components so base weights still sum to 100.
+
+    Base weights (binding_prefilter excluded):
+      docking_affinity  51   (was 45 + share of 12)
+      admet_safety      28   (was 25 + share of 12)
+      drug_likeness     11   (was 10 + share of 12)
+      synthesis_ease     9   (was  8 + share of 12)
+      ─────────────────────
+      total            99   → rounded up to 100 via largest-remainder
+
+    Actual values below are exact integers summing to 100.
     """
 
-    # Base weights — must sum to 100
+    # Base weights — must sum to 100, binding_prefilter NOT included
     weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "docking_affinity": 45,
-            "admet_safety":     25,
-            "drug_likeness":    10,
-            "binding_prefilter": 12,
-            "synthesis_ease":    8,
+            "docking_affinity": 51,
+            "admet_safety":     28,
+            "drug_likeness":    11,
+            "synthesis_ease":   10,
         }
     )
 
     # Maps component name → PipelineSteps attribute name
-    # Used by _resolve_active_weights() to check which steps are enabled.
     component_to_step: Dict[str, str] = field(
         default_factory=lambda: {
-            "docking_affinity":  "docking",
-            "admet_safety":      "admet",
-            "drug_likeness":     "drug_likeness",
-            "binding_prefilter": "binding_prefilter",
-            "synthesis_ease":    "retrosynthesis",
+            "docking_affinity": "docking",
+            "admet_safety":     "admet",
+            "drug_likeness":    "drug_likeness",
+            "synthesis_ease":   "retrosynthesis",
         }
     )
 
-    # Docking / prefilter affinity normalization (kcal/mol)
+    # Docking affinity normalization (kcal/mol)
     affinity_best:  float = -12.0
     affinity_worst: float = -3.0
 
     # Retrosynthesis complexity normalization
     complexity_best:  float = 15.0
     complexity_worst: float = 65.0
-
-    # Minimum binding prefilter confidence to include in scoring at all
-    prefilter_min_confidence: float = 0.25
 
     # MW floor below which final score is halved
     mw_fragment_floor: float = 200.0
@@ -101,21 +110,18 @@ class ScoringConfig:
     # Sorted from least-negative to most-negative (highest to lowest logS).
     #
     # Scientific rationale:
-    #   logS > -3  = soluble in any practical sense (~1 mg/mL+) → should score well.
-    #   logS -3→-4 = still decent for oral delivery; many approved drugs sit here.
-    #   logS -4→-5 = borderline; formulation may help but it's not a blocker.
-    #   logS < -5  = genuinely poor solubility; starts mattering for bioavailability.
-    #   logS < -6  = problematic; will likely need a formulation strategy.
-    #
-    # OLD scores gave logS=-3 → 0.30 (solubility class "Low" = 3/10).
-    # That was way too harsh; the new curve gives logS=-3 → 0.90.
+    #   logS > -3  = soluble in any practical sense (~1 mg/mL+) → scores well.
+    #   logS -3→-4 = decent for oral delivery; many approved drugs sit here.
+    #   logS -4→-5 = borderline; formulation may help but not a blocker.
+    #   logS < -5  = genuinely poor solubility; affects bioavailability.
+    #   logS < -6  = problematic; will likely need formulation strategy.
     logs_breakpoints: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (-1.0, 1.00),   # logS ≥ -1:  very soluble → perfect score
-            (-3.0, 0.90),   # logS ≥ -3:  soluble → excellent (not 3/10 anymore)
-            (-4.0, 0.75),   # logS ≥ -4:  decent → good ("below 4 is good")
-            (-5.0, 0.45),   # logS ≥ -5:  borderline → mediocre ("5 starts being bad")
-            (-6.0, 0.20),   # logS ≥ -6:  poor → low
+            (-1.0, 1.00),   # logS ≥ -1:  very soluble   → perfect
+            (-3.0, 0.90),   # logS ≥ -3:  soluble         → excellent
+            (-4.0, 0.75),   # logS ≥ -4:  decent          → good
+            (-5.0, 0.45),   # logS ≥ -5:  borderline      → mediocre
+            (-6.0, 0.20),   # logS ≥ -6:  poor            → low
         ]
     )
     logs_default_score: float = 0.05   # logS < -6: essentially insoluble
@@ -145,8 +151,13 @@ DEFAULT_CONFIG = ScoringConfig()
 
 _HARD_FAIL_ENDPOINTS = {"hERG Inhibition", "Hepatotoxicity"}
 
+# binding_prefilter is always excluded from scoring weights
+_EXCLUDED_FROM_SCORING = {"binding_prefilter"}
+
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
 
 
 def score_and_rank(
@@ -167,6 +178,7 @@ def score_and_rank(
     return ranked
 
 
+
 def get_score_breakdown(
     compound:       CompoundResult,
     pipeline_steps: Optional[PipelineSteps] = None,
@@ -177,20 +189,22 @@ def get_score_breakdown(
     return _build_breakdown(compound, cfg, effective_weights)
 
 
+
 def get_effective_weights(
     pipeline_steps: Optional[PipelineSteps] = None,
     config:         Optional[ScoringConfig] = None,
 ) -> Dict[str, float]:
     """
-    Returns the redistributed weights for the given pipeline configuration.
-    Call this from the frontend to show users which components are active
-    and what weight each carries after redistribution.
+    Returns the redistributed whole-number weights for the given pipeline
+    configuration. binding_prefilter is never included.
     """
     cfg = config or DEFAULT_CONFIG
     return _resolve_active_weights(pipeline_steps, cfg)
 
 
+
 # ── Weight redistribution ─────────────────────────────────────────────────────
+
 
 
 def _resolve_active_weights(
@@ -201,26 +215,26 @@ def _resolve_active_weights(
     Compute per-component effective weights after redistributing the weight
     of any disabled pipeline step to the remaining active components.
 
-    Example: if docking (45 pts) is disabled:
-      - active base total = 55 pts
-      - each active weight is scaled by 100/55
-      - docking_affinity effective weight = 0.0
+    binding_prefilter is always excluded (it's a gate, not a scorer).
+    All returned weights are whole integers summing to 100 via
+    largest-remainder rounding.
 
-    The returned dict always sums to 100.0 across active components.
+    Example: if docking (51 pts) is disabled:
+      - active base total = 49 pts
+      - each active weight is scaled by 100/49 then rounded to integers
+      - docking_affinity effective weight = 0
     """
     if pipeline_steps is None:
-        # No pipeline context → use base weights as-is
-        return {k: float(w) for k, w in cfg.weights.items()}
+        return _round_to_whole_numbers({k: float(w) for k, w in cfg.weights.items()})
 
     active: Dict[str, float] = {}
-    disabled: List[str] = []
 
     for component, step_attr in cfg.component_to_step.items():
+        if component in _EXCLUDED_FROM_SCORING:
+            continue
         is_enabled = getattr(pipeline_steps, step_attr, True)
         if is_enabled:
             active[component] = cfg.weights[component]
-        else:
-            disabled.append(component)
 
     if not active:
         return {k: 0.0 for k in cfg.weights}
@@ -228,28 +242,60 @@ def _resolve_active_weights(
     active_total = sum(active.values())
     scale = 100.0 / active_total
 
-    result: Dict[str, float] = {}
+    # Float scaled weights
+    float_weights: Dict[str, float] = {}
     for component in cfg.weights:
-        if component in active:
-            result[component] = round(active[component] * scale, 4)
+        if component in _EXCLUDED_FROM_SCORING:
+            float_weights[component] = 0.0
+        elif component in active:
+            float_weights[component] = active[component] * scale
         else:
-            result[component] = 0.0
+            float_weights[component] = 0.0
 
+    return _round_to_whole_numbers(float_weights)
+
+
+
+def _round_to_whole_numbers(weights: Dict[str, float]) -> Dict[str, float]:
+    """
+    Largest-remainder method: rounds floats to integers while guaranteeing
+    the sum is exactly 100 (for active components).
+    Zero weights stay zero.
+    """
+    active_keys = [k for k, v in weights.items() if v > 0]
+    if not active_keys:
+        return {k: 0.0 for k in weights}
+
+    floors = {k: int(weights[k]) for k in active_keys}
+    remainders = {k: weights[k] - floors[k] for k in active_keys}
+
+    current_sum = sum(floors.values())
+    deficit = 100 - current_sum  # how many extra 1s to distribute
+
+    # Sort by remainder descending, give +1 to top `deficit` keys
+    sorted_by_remainder = sorted(active_keys, key=lambda k: remainders[k], reverse=True)
+    for i, k in enumerate(sorted_by_remainder):
+        floors[k] += 1 if i < deficit else 0
+
+    result: Dict[str, float] = {}
+    for k in weights:
+        result[k] = float(floors[k]) if k in floors else 0.0
     return result
+
 
 
 # ── Core scoring ──────────────────────────────────────────────────────────────
 
 
+
 def _compute_score(
-    c:                CompoundResult,
-    pipeline_steps:   Optional[PipelineSteps],
-    cfg:              ScoringConfig,
+    c:                 CompoundResult,
+    pipeline_steps:    Optional[PipelineSteps],
+    cfg:               ScoringConfig,
     effective_weights: Dict[str, float],
 ) -> float:
     """
     Hard zero: docking was enabled but no result arrived.
-    A compound that never completed docking cannot outrank one that did.
     """
     if pipeline_steps is not None and pipeline_steps.docking and c.docking is None:
         return 0.0
@@ -257,27 +303,20 @@ def _compute_score(
     earned = 0.0
     denominator = 0.0
 
-    # Each scorer returns (score_0_to_1) or None if data is absent.
-    # We only include a component in the denominator when:
-    #   (a) its step is enabled (effective_weight > 0), AND
-    #   (b) data for it actually exists on this compound.
-    # If a step is enabled but data is absent (e.g. prefilter low confidence),
-    # the weight is still included in the denominator to prevent inflation.
-
     def _add(key: str, score: Optional[float], *, data_present: bool) -> None:
         nonlocal earned, denominator
         w = effective_weights.get(key, 0.0)
         if w == 0.0:
-            return  # step disabled; skip entirely
+            return
         denominator += w
         if score is not None and data_present:
             earned += score * w
 
-    _add("docking_affinity",  _score_docking(c, cfg),            data_present=c.docking is not None)
-    _add("admet_safety",      _score_admet(c, cfg),              data_present=c.admet is not None)
-    _add("drug_likeness",     _score_drug_likeness(c, cfg),      data_present=c.lipinski is not None)
-    _add("binding_prefilter", _score_binding_prefilter(c, cfg),  data_present=c.binding_prefilter is not None)
-    _add("synthesis_ease",    _score_synthesis(c, cfg),          data_present=c.retrosynthesis is not None)
+    _add("docking_affinity", _score_docking(c, cfg),       data_present=c.docking is not None)
+    _add("admet_safety",     _score_admet(c, cfg),         data_present=c.admet is not None)
+    _add("drug_likeness",    _score_drug_likeness(c, cfg), data_present=c.lipinski is not None)
+    _add("synthesis_ease",   _score_synthesis(c, cfg),     data_present=c.retrosynthesis is not None)
+    # binding_prefilter intentionally omitted
 
     if denominator == 0.0:
         return 0.0
@@ -291,13 +330,16 @@ def _compute_score(
     return round(min(max(scaled, 0.0), 100.0), 2)
 
 
+
 # ── Component scorers ─────────────────────────────────────────────────────────
+
 
 
 def _score_docking(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     if c.docking is None or c.docking.best_affinity_kcal == 0.0:
         return None
     return _normalize(c.docking.best_affinity_kcal, cfg.affinity_worst, cfg.affinity_best)
+
 
 
 def _score_admet(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
@@ -320,15 +362,14 @@ def _score_admet(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     return max(0.0, base - min(cumulative_penalty, base))
 
 
+
 def _score_drug_likeness(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     if c.lipinski is None:
         return None
 
-    # 1. Lipinski violations sub-score
-    violations  = _count_lipinski_violations(c.lipinski)
-    viol_score  = cfg.violation_scores.get(violations, 0.0)
+    violations = _count_lipinski_violations(c.lipinski)
+    viol_score = cfg.violation_scores.get(violations, 0.0)
 
-    # 2. logS continuous sub-score
     logs       = c.lipinski.logs
     logs_score = cfg.logs_default_score
     for threshold, score in sorted(cfg.logs_breakpoints, reverse=True):
@@ -336,7 +377,6 @@ def _score_drug_likeness(c: CompoundResult, cfg: ScoringConfig) -> Optional[floa
             logs_score = score
             break
 
-    # 3. logP optimality sub-score
     logp = c.lipinski.logp
     if cfg.logp_ideal_min <= logp <= cfg.logp_ideal_max:
         logp_score = 1.00
@@ -354,25 +394,6 @@ def _score_drug_likeness(c: CompoundResult, cfg: ScoringConfig) -> Optional[floa
     )
     return min(max(combined, 0.0), 1.0)
 
-
-def _score_binding_prefilter(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
-    if c.binding_prefilter is None:
-        return None
-    if c.binding_prefilter.confidence < cfg.prefilter_min_confidence:
-        return None
-
-    base = _normalize(
-        c.binding_prefilter.predicted_affinity_kcal, cfg.affinity_worst, cfg.affinity_best
-    )
-
-    conf     = c.binding_prefilter.confidence
-    min_conf = cfg.prefilter_min_confidence
-    if min_conf >= 1.0:
-        conf_weight = 1.0
-    else:
-        conf_weight = 0.40 + 0.60 * (conf - min_conf) / (1.0 - min_conf)
-
-    return min(1.0, base * conf_weight)
 
 
 def _score_synthesis(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
@@ -400,7 +421,9 @@ def _score_synthesis(c: CompoundResult, cfg: ScoringConfig) -> Optional[float]:
     return complexity_score * 0.60 + step_score * 0.40
 
 
+
 # ── Breakdown ─────────────────────────────────────────────────────────────────
+
 
 
 def _build_breakdown(
@@ -417,17 +440,21 @@ def _build_breakdown(
         explanation:  str,
         data_present: bool = True,
     ) -> dict:
-        ew = effective_weights.get(key, 0.0)
+        ew = effective_weights.get(key, 0.0)      # whole-number pts (e.g. 51)
         bw = cfg.weights.get(key, 0.0)
         s  = score if (score is not None and data_present) else 0.0
+        # contribution is also a whole-number-friendly value:
+        # score_0_to_1 × effective_weight gives pts earned out of ew
+        contribution = round(s * ew, 1)
         return {
-            "score_0_to_1":    round(s, 3),
-            "raw":             raw,
-            "contribution":    round(s * ew, 2),
-            "base_weight":     bw,
-            "effective_weight": round(ew, 2),
-            "explanation":     explanation,
-            "step_active":     ew > 0.0,
+            "score_0_to_1":     round(s, 3),
+            "raw":              raw,
+            "contribution":     contribution,       # pts earned  (e.g. 25.5)
+            "max_possible":     ew,                 # whole-number max (e.g. 51)
+            "base_weight":      bw,
+            "effective_weight": ew,
+            "explanation":      explanation,
+            "step_active":      ew > 0.0,
         }
 
     # ── Docking ───────────────────────────────────────────────────────────────
@@ -446,15 +473,13 @@ def _build_breakdown(
             )
         else:
             bd["docking_affinity"] = _entry(
-                "docking_affinity",
-                0.0,
+                "docking_affinity", 0.0,
                 "Affinity = 0.0 — docking error.",
                 "Zero affinity value excluded from scoring.",
             )
     elif _docking_was_attempted(c):
         bd["docking_affinity"] = _entry(
-            "docking_affinity",
-            0.0,
+            "docking_affinity", 0.0,
             "Passed prefilter — docking did not complete (timeout/crash).",
             "Compound scored 0 and excluded from ranking.",
         )
@@ -492,26 +517,28 @@ def _build_breakdown(
                 f"Lipinski violations ({cfg.dl_violations_weight*100:.0f}%) + "
                 f"logS ({cfg.dl_logs_weight*100:.0f}%) + "
                 f"logP optimality ({cfg.dl_logp_weight*100:.0f}%). "
-                "LogS ≥ -4 = good; ≥ -5 = marginal; < -5 = poor."
+                "LogS ≥ -3: Excellent; ≥ -4: Good; ≥ -5: Borderline; ≥ -6: Poor; < -6: Insoluble."
             ),
         )
 
-    # ── Binding prefilter ─────────────────────────────────────────────────────
-    pre_score = _score_binding_prefilter(c, cfg)
+    # ── Binding prefilter (gate info only — no score contribution) ────────────
     if c.binding_prefilter is not None:
         conf    = c.binding_prefilter.confidence
         pre_aff = c.binding_prefilter.predicted_affinity_kcal
-        bd["binding_prefilter"] = _entry(
-            "binding_prefilter",
-            pre_score,
-            f"{pre_aff:.2f} kcal/mol (confidence={conf:.2f})",
-            (
-                "Normalised affinity scaled by confidence weight. "
-                f"Min confidence to include: {cfg.prefilter_min_confidence}. "
-                "Low confidence → partial contribution rather than hard exclusion."
+        bd["binding_prefilter"] = {
+            "gate_only":    True,
+            "passed":       c.binding_prefilter.passed,
+            "raw":          f"{pre_aff:.2f} kcal/mol (confidence={conf:.2f})",
+            "contribution": 0,
+            "max_possible": 0,
+            "effective_weight": 0,
+            "step_active":  False,
+            "explanation":  (
+                "Binding prefilter acts as a pass/fail gate only — "
+                "it contributes 0 pts to the final score. "
+                "Its former 12-pt weight has been redistributed to the four scoring components."
             ),
-            data_present=(pre_score is not None),
-        )
+        }
 
     # ── Synthesis ease ────────────────────────────────────────────────────────
     synth_score = _score_synthesis(c, cfg)
@@ -524,18 +551,18 @@ def _build_breakdown(
                 f"Complexity={c.retrosynthesis.complexity_score:.1f} | "
                 f"Feasible={c.retrosynthesis.feasible}"
             ),
-            "60% normalised complexity + 40% step-count penalty.",
+            "60% normalised complexity + 40% step-count score.",
         )
 
     # ── Weight redistribution info ────────────────────────────────────────────
     bd["weight_redistribution"] = {
-        "base_weights": {k: cfg.weights[k] for k in cfg.weights},
-        "effective_weights": {k: round(v, 2) for k, v in effective_weights.items()},
-        "disabled_components": [
-            k for k, v in effective_weights.items() if v == 0.0
-        ],
+        "base_weights":         {k: cfg.weights[k] for k in cfg.weights},
+        "effective_weights":    {k: round(v, 0) for k, v in effective_weights.items()},
+        "disabled_components":  [k for k, v in effective_weights.items() if v == 0.0],
+        "excluded_from_scoring": list(_EXCLUDED_FROM_SCORING),
         "note": (
-            "Effective weights always sum to 100. "
+            "Effective weights are whole integers summing to 100. "
+            "binding_prefilter is permanently excluded from scoring. "
             "Disabled steps have their base weight redistributed "
             "proportionally to active components."
         ),
@@ -545,16 +572,18 @@ def _build_breakdown(
     mw = c.lipinski.mw if c.lipinski else None
     bd["penalties"] = {
         "mw_fragment_penalty_applied": bool(mw is not None and mw < cfg.mw_fragment_floor),
-        "mw_value":    mw,
-        "mw_floor":    cfg.mw_fragment_floor,
-        "effect":      "50% final score halved" if (mw is not None and mw < cfg.mw_fragment_floor) else "none",
+        "mw_value":  mw,
+        "mw_floor":  cfg.mw_fragment_floor,
+        "effect":    "Final score halved (MW < 200 Da)" if (mw is not None and mw < cfg.mw_fragment_floor) else "none",
     }
 
     bd["final_score"] = c.final_score
     return bd
 
 
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 
 def _normalize(value: float, worst: float, best: float) -> float:
@@ -563,13 +592,15 @@ def _normalize(value: float, worst: float, best: float) -> float:
     return min(max((value - worst) / (best - worst), 0.0), 1.0)
 
 
+
 def _count_lipinski_violations(lipinski) -> int:
     violations = 0
-    if lipinski.mw   > 500:  violations += 1
-    if lipinski.logp > 5:    violations += 1
-    if lipinski.hbd  > 5:    violations += 1
-    if lipinski.hba  > 10:   violations += 1
+    if lipinski.mw   > 500: violations += 1
+    if lipinski.logp > 5:   violations += 1
+    if lipinski.hbd  > 5:   violations += 1
+    if lipinski.hba  > 10:  violations += 1
     return violations
+
 
 
 def _docking_was_attempted(c: CompoundResult) -> bool:
