@@ -11,6 +11,8 @@
 ![RDKit](https://img.shields.io/badge/RDKit-2023.9-0B5394)
 ![Docker](https://img.shields.io/badge/Docker-HF%20Space-2496ED?logo=docker&logoColor=white)
 
+**[→ Try it live](https://caddpipeline.vercel.app)**
+
 </div>
 
 ---
@@ -169,10 +171,10 @@ python tests/test_backend.py
 
 ## Deployment
 
-| Part | Platform |
-|------|----------|
-| Backend | Hugging Face Docker Space (`backend/`) |
-| Frontend | Vercel (root directory: `frontend/`) |
+| Part | Platform | Live |
+|------|----------|------|
+| Frontend | Vercel (root directory: `frontend/`) | [caddpipeline.vercel.app](https://caddpipeline.vercel.app) |
+| Backend | Hugging Face Docker Space (`backend/`) | [novoo5-cadd-backend.hf.space](https://novoo5-cadd-backend.hf.space) |
 
 ## Project history
 
