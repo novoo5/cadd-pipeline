@@ -10,6 +10,7 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![RDKit](https://img.shields.io/badge/RDKit-2023.9-0B5394)
 ![Docker](https://img.shields.io/badge/Docker-HF%20Space-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 **[→ Try it live](https://caddpipeline.vercel.app)**
 
@@ -198,3 +199,7 @@ This repository combines two codebases that were first developed separately: the
 ## Acknowledgements
 
 Built on these open-source projects: [RDKit](https://www.rdkit.org/), [ADMET-AI](https://github.com/swansonk14/admet_ai), [DeepChem](https://deepchem.io/), [AutoDock Vina](https://github.com/ccsb-scripps/AutoDock-Vina), [Open Babel](https://openbabel.org/), [FastAPI](https://fastapi.tiangolo.com/), [ARQ](https://arq-docs.helpmanual.io/) and [Next.js](https://nextjs.org/).
+
+## License
+
+Released under the [MIT License](LICENSE).
