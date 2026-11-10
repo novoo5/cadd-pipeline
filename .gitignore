@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.pytest_cache/
+
+# Runtime job data (docking files, results)
+storage/
+backend/storage/
+
+# Node / Next.js (see also frontend/.gitignore)
+node_modules/
+.next/
+*.tsbuildinfo
+.vercel
+
+# Local env files
+.env.local
+.env.*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
