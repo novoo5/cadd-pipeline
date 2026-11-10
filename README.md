@@ -17,6 +17,21 @@
 
 ---
 
+## Interface
+
+The web interface is a dark, instrument-panel style console built for dense
+scientific data. It is organised around three screens:
+
+| Screen | Purpose |
+|--------|---------|
+| **Compound Screening** | Enter a SMILES string and target protein, then tune every pipeline stage under Advanced Settings — run mode, analogue count, ADMET thresholds, docking exhaustiveness and binding-site detection. |
+| **Live Status** | Watch each of the eight pipeline stages move through waiting, running, done or skipped while the job runs. |
+| **Results** | Browse ranked compounds with their score breakdown, full ADMET endpoint table, docking poses and synthesis route — and download the pose and complex files. |
+
+Design notes: a cool graphite palette with a single mint accent, JetBrains Mono
+for SMILES and numeric readouts, and hairline borders throughout so dense tables
+stay readable. Motion is disabled for users who prefer reduced motion.
+
 ## Overview
 
 CADD Pipeline takes a lead compound (as a SMILES string) and a protein target (a PDB ID or an uploaded `.pdb` file). It then runs a full virtual-screening workflow:
